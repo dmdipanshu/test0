@@ -1,81 +1,48 @@
-# main.py
-import os
-import logging
-import sqlite3
-import threading
 import asyncio
+import logging
+import os
+import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Dict
 
-import uvicorn
-from fastapi import FastAPI
-
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart, Command
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command, CommandStart
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 # ───────────────────────── Logging ─────────────────────────
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("subbot")
 
-# ───────────────────────── Config from Env ─────────────────────────
-def load_config() -> dict:
-    cfg = {
-        "API_TOKEN": os.getenv("API_TOKEN"),
-        "ADMIN_ID": os.getenv("ADMIN_ID"),
-        "CHANNEL_ID": os.getenv("CHANNEL_ID"),
-        "UPI_ID": os.getenv("UPI_ID"),
-        "QR_CODE_URL": os.getenv("QR_CODE_URL"),
-    }
-    missing = [k for k, v in cfg.items() if not v]
-    if missing:
-        raise ValueError(f"Missing environment variables: {', '.join(missing)}")
+# ───────────────────────── Config (ENV based for Koyeb) ─────────────────────────
+API_TOKEN = os.getenv("API_TOKEN") or "TEST_TOKEN"
+ADMIN_ID = int(os.getenv("ADMIN_ID") or "123456789")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID") or "-10012345678")
+UPI_ID = os.getenv("UPI_ID") or "yourupi@upi"
+QR_CODE_URL = os.getenv("QR_CODE_URL") or "https://example.com/qr.png"
 
-    try:
-        cfg["ADMIN_ID"] = int(cfg["ADMIN_ID"])
-        cfg["CHANNEL_ID"] = int(cfg["CHANNEL_ID"])
-    except Exception:
-        raise ValueError("ADMIN_ID and CHANNEL_ID must be integer values")
+if API_TOKEN == "TEST_TOKEN":
+    raise RuntimeError("❌ API_TOKEN not set! Please configure environment variables.")
 
-    return cfg
-
-cfg = load_config()
-API_TOKEN = cfg["API_TOKEN"]
-ADMIN_ID = cfg["ADMIN_ID"]
-CHANNEL_ID = cfg["CHANNEL_ID"]
-UPI_ID = cfg["UPI_ID"]
-QR_CODE_URL = cfg["QR_CODE_URL"]
-
-# ───────────────────────── Bot & Dispatcher ─────────────────────────
-bot = Bot(token=API_TOKEN)
+bot = Bot(API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# ───────────────────────── FastAPI (health / optional web) ─────────────────────────
-app = FastAPI()
-
-@app.get("/")
-async def root():
-    return {"status": "ok", "bot": (await bot.get_me()).username if bot else "n/a"}
-
-# ───────────────────────── Plans & Memory ─────────────────────────
+# ───────────────────────── Plans ─────────────────────────
 PLANS = {
     "plan1": {"name": "1 Month",  "price": "₹99",   "days": 30},
     "plan2": {"name": "6 Months", "price": "₹199",  "days": 180},
     "plan3": {"name": "1 Year",   "price": "₹1999", "days": 365},
     "plan4": {"name": "Lifetime", "price": "₹2999", "days": 36500},
 }
+last_selected_plan: Dict[int, str] = {}
 
-# Keep last user-selected plan in memory
-last_selected_plan: dict[int, str] = {}
-
-# ───────────────────────── SQLite ─────────────────────────
-DB = "subs.db"
+# ───────────────────────── SQLite (ephemeral in Koyeb) ─────────────────────────
+DB = "/tmp/subs.db"
 
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB, check_same_thread=False)
+    conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -90,7 +57,8 @@ def init_db():
             start_at TEXT,
             end_at TEXT,
             status TEXT,
-            created_at TEXT
+            created_at TEXT,
+            reminded_3d INTEGER DEFAULT 0
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS payments(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,17 +77,6 @@ def init_db():
         )""")
         c.commit()
 
-    # Add missing columns if DB exists from older versions
-    def ensure_col(table: str, col: str, ddl: str):
-        with db() as c:
-            cols = [r["name"] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]
-            if col not in cols:
-                c.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
-                c.commit()
-
-    ensure_col("users", "reminded_3d", "reminded_3d INTEGER DEFAULT 0")
-
-# ───────────────────────── DB Helpers ─────────────────────────
 def upsert_user(usr: types.User):
     with db() as c:
         now = datetime.now(timezone.utc).isoformat()
@@ -157,18 +114,15 @@ def set_subscription(user_id: int, plan_key: str, days: int):
         except Exception:
             current_end = now
         base = current_end if (row["status"] == "active" and current_end > now) else now
-        start = now
         end = base + timedelta(days=days)
     else:
-        start = now
         end = now + timedelta(days=days)
-
     with db() as c:
         c.execute("""UPDATE users SET plan_key=?, start_at=?, end_at=?, status='active', reminded_3d=0
                      WHERE user_id=?""",
-                  (plan_key, start.isoformat(), end.isoformat(), user_id))
+                  (plan_key, now.isoformat(), end.isoformat(), user_id))
         c.commit()
-    return start, end
+    return now, end
 
 def add_payment(user_id: int, plan_key: str, file_id: str) -> int:
     with db() as c:
@@ -196,11 +150,6 @@ def add_ticket(user_id: int, message: str) -> int:
         tid = c.execute("SELECT last_insert_rowid() id").fetchone()["id"]
         c.commit()
         return tid
-
-def mark_reminded(user_id: int):
-    with db() as c:
-        c.execute("UPDATE users SET reminded_3d=1 WHERE user_id=?", (user_id,))
-        c.commit()
 
 def stats():
     with db() as c:
@@ -263,13 +212,10 @@ def is_admin(uid: int) -> bool:
     return uid == ADMIN_ID
 
 # ───────────────────────── FSM for broadcast ─────────────────────────
-class Broadcast(StatesGroup):
-    waiting_text = State()
-
 class BCast(StatesGroup):
     waiting_text = State()
 
-# ───────────────────────── Handlers ─────────────────────────
+# ───────────────────────── User Flow ─────────────────────────
 @dp.message(CommandStart())
 async def on_start(m: types.Message):
     upsert_user(m.from_user)
@@ -291,11 +237,7 @@ async def on_plan(cq: types.CallbackQuery):
         f"Or scan this QR.\n\n"
         f"Then tap **I Paid — Send Screenshot** and upload your proof."
     )
-    try:
-        await cq.message.answer_photo(QR_CODE_URL, caption=caption, parse_mode="Markdown", reply_markup=kb_after_plan(plan_key))
-    except Exception:
-        # fallback if photo fails
-        await cq.message.answer(caption, parse_mode="Markdown", reply_markup=kb_after_plan(plan_key))
+    await cq.message.answer_photo(QR_CODE_URL, caption=caption, parse_mode="Markdown", reply_markup=kb_after_plan(plan_key))
     await cq.answer()
 
 @dp.callback_query(F.data.startswith("pay:ask:"))
@@ -326,7 +268,6 @@ async def on_support(cq: types.CallbackQuery):
     await bot.send_message(cq.from_user.id, "📞 Please type your question/issue. I’ll forward it to support.")
     await cq.answer()
 
-# Any plain text from user → support ticket (ignore commands)
 @dp.message(F.text & (F.from_user.id != ADMIN_ID))
 async def on_user_text(m: types.Message):
     if m.text.startswith("/"):
@@ -340,7 +281,6 @@ async def on_user_text(m: types.Message):
     )
     await m.answer(f"✅ Sent to support. Ticket ID: #{tid}")
 
-# Payment proof (photo)
 @dp.message(F.photo & (F.from_user.id != ADMIN_ID))
 async def on_payment_photo(m: types.Message):
     plan_key = last_selected_plan.get(m.from_user.id, "plan1")
@@ -354,7 +294,6 @@ async def on_payment_photo(m: types.Message):
     await bot.send_photo(ADMIN_ID, m.photo[-1].file_id, reply_markup=kb_payment_actions(pid, m.from_user.id))
     await m.answer("✅ Screenshot received. Admin will review shortly.")
 
-# ───────────────────────── Admin Panel ─────────────────────────
 @dp.callback_query(F.data == "admin:menu")
 async def admin_menu(cq: types.CallbackQuery):
     if not is_admin(cq.from_user.id):
@@ -383,11 +322,8 @@ async def admin_approve(cq: types.CallbackQuery):
     pid = int(pid); uid = int(uid)
     if plan_key not in PLANS:
         await cq.answer("Unknown plan.", show_alert=True); return
-
     set_payment_status(pid, "approved")
     _, end = set_subscription(uid, plan_key, PLANS[plan_key]["days"])
-
-    # Create one-time invite link
     try:
         link = await bot.create_chat_invite_link(CHANNEL_ID, member_limit=1)
         await bot.send_message(uid,
@@ -398,7 +334,6 @@ async def admin_approve(cq: types.CallbackQuery):
         log.error(f"Invite link error: {e}")
         await bot.send_message(uid,
             f"🎉 Payment approved!\nPlan: {PLANS[plan_key]['name']}\nValid till: {end.astimezone().strftime('%Y-%m-%d %H:%M')}")
-
     await cq.message.answer(f"✅ Approved payment #{pid} for user {uid} → {PLANS[plan_key]['name']}")
     await cq.answer("Approved.")
 
@@ -441,7 +376,6 @@ async def admin_stats(cq: types.CallbackQuery):
     )
     await cq.answer()
 
-# Broadcast
 @dp.callback_query(F.data == "admin:broadcast")
 async def bc_start(cq: types.CallbackQuery, state: FSMContext):
     if not is_admin(cq.from_user.id):
@@ -466,7 +400,6 @@ async def bc_send(m: types.Message, state: FSMContext):
     await m.answer(f"📢 Broadcast done. Sent: {sent}, Failed: {fail}")
     await state.clear()
 
-# Quick admin reply
 @dp.callback_query(F.data.startswith("admin:reply:"))
 async def admin_reply_hint(cq: types.CallbackQuery):
     if not is_admin(cq.from_user.id):
@@ -487,70 +420,48 @@ async def admin_reply_cmd(m: types.Message):
 
 # ───────────────────────── Auto-Expiry Worker ─────────────────────────
 async def expiry_worker():
-    """Every 30 min:
-       - 3-day reminders
-       - mark expired
-       - remove expired from channel (ban/unban)
-    """
     while True:
         try:
             now = datetime.now(timezone.utc)
-            rows = list_users(10000)
+            with db() as c:
+                rows = c.execute("SELECT * FROM users").fetchall()
             for r in rows:
-                uid = r["user_id"]
-                end_at = r["end_at"]
-                status = r["status"]
-                reminded = r["reminded_3d"] if "reminded_3d" in r.keys() else 0
-
-                if end_at:
+                uid, status, end_at, reminded = r["user_id"], r["status"], r["end_at"], r["reminded_3d"]
+                if not end_at: continue
+                try:
+                    end = datetime.fromisoformat(end_at)
+                except: continue
+                if status == "active" and not reminded and end > now and (end - now) <= timedelta(days=3):
                     try:
-                        end = datetime.fromisoformat(end_at)
-                    except Exception:
-                        continue
-
-                    # 3-day reminder
-                    if status == "active" and not reminded and end > now and (end - now) <= timedelta(days=3):
-                        try:
-                            await bot.send_message(uid, "⏳ Your subscription expires in ~3 days. Renew via /start.")
-                            mark_reminded(uid)
-                        except Exception:
-                            pass
-
-                    # Expired
-                    if end <= now and status != "expired":
-                        set_status(uid, "expired")
-                        try:
-                            await bot.ban_chat_member(CHANNEL_ID, uid)
-                            await bot.unban_chat_member(CHANNEL_ID, uid)
-                        except Exception:
-                            pass
-                        try:
-                            await bot.send_message(uid, "❌ Your subscription expired. Use /start to renew.")
-                        except Exception:
-                            pass
+                        await bot.send_message(uid, "⏳ Your subscription expires in ~3 days. Renew soon.")
+                        with db() as c:
+                            c.execute("UPDATE users SET reminded_3d=1 WHERE user_id=?", (uid,))
+                            c.commit()
+                    except: pass
+                if end <= now and status != "expired":
+                    with db() as c:
+                        c.execute("UPDATE users SET status='expired' WHERE user_id=?", (uid,))
+                        c.commit()
+                    try:
+                        await bot.ban_chat_member(CHANNEL_ID, uid)
+                        await bot.unban_chat_member(CHANNEL_ID, uid)
+                    except: pass
+                    try:
+                        await bot.send_message(uid, "❌ Your subscription expired. Use /start to renew.")
+                    except: pass
         except Exception as e:
             log.exception(f"expiry_worker error: {e}")
-        await asyncio.sleep(1800)  # 30 minutes
+        await asyncio.sleep(1800)
 
-# ───────────────────────── Main runner ─────────────────────────
-def start_webserver_in_thread():
-    port = int(os.getenv("PORT", "8080"))
-    thread = threading.Thread(
-        target=uvicorn.run,
-        kwargs={"app": app, "host": "0.0.0.0", "port": port, "log_level": "info"},
-        daemon=True,
-    )
-    thread.start()
-    log.info("Started web server thread (uvicorn).")
-
-async def start_bot_and_workers():
-    log.info("Starting aiogram dispatcher and background workers...")
-    # expiry worker
+# ───────────────────────── Main ─────────────────────────
+async def main():
+    init_db()
+    log.info("Bot starting on Koyeb ✅")
     asyncio.create_task(expiry_worker())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    init_db()
-    start_webserver_in_thread()
-    # Run bot + workers in asyncio
-    asyncio.run(start_bot_and_workers())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Bot stopped.")

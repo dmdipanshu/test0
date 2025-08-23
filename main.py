@@ -11,6 +11,8 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.enums import ParseMode
+from aiogram.utils.markdown import escape_md
 
 # ───────────────────────── Logging ─────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -211,6 +213,22 @@ def fmt_dt(dtiso: Optional[str]) -> str:
 def is_admin(uid: int) -> bool:
     return uid == ADMIN_ID
 
+# Helper function to safely escape user input for Markdown
+def safe_escape(text: str) -> str:
+    """Escape special characters for Markdown parsing"""
+    if not text:
+        return "-"
+    # Replace problematic characters that can break Markdown
+    text = str(text)
+    text = text.replace("_", "\\_")
+    text = text.replace("*", "\\*")
+    text = text.replace("`", "\\`")
+    text = text.replace("[", "\\[")
+    text = text.replace("]", "\\]")
+    text = text.replace("(", "\\(")
+    text = text.replace(")", "\\)")
+    return text
+
 # ───────────────────────── FSM for broadcast ─────────────────────────
 class BCast(StatesGroup):
     waiting_text = State()
@@ -237,21 +255,21 @@ async def on_plan(cq: types.CallbackQuery):
         f"Or scan this QR.\n\n"
         f"Then tap **I Paid — Send Screenshot** and upload your proof."
     )
-    await cq.message.answer_photo(QR_CODE_URL, caption=caption, parse_mode="Markdown", reply_markup=kb_after_plan(plan_key))
+    await cq.message.answer_photo(QR_CODE_URL, caption=caption, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_after_plan(plan_key))
     await cq.answer()
 
 @dp.callback_query(F.data.startswith("pay:ask:"))
 async def on_pay_ask(cq: types.CallbackQuery):
     plan_key = cq.data.split(":")[2]
     last_selected_plan[cq.from_user.id] = plan_key
-    await bot.send_message(cq.from_user.id, f"📤 Send your payment *screenshot* now.\nSelected: {PLANS[plan_key]['name']}", parse_mode="Markdown")
+    await bot.send_message(cq.from_user.id, f"📤 Send your payment *screenshot* now.\nSelected: {PLANS[plan_key]['name']}", parse_mode=ParseMode.MARKDOWN)
     await cq.answer()
 
 @dp.callback_query(F.data == "menu:my")
 async def on_my_plan(cq: types.CallbackQuery):
     r = get_user(cq.from_user.id)
     if not r or r["status"] != "active":
-        await cq.message.answer("❌ No active subscription.\nUse *Buy Subscription* to get access.", parse_mode="Markdown")
+        await cq.message.answer("❌ No active subscription.\nUse *Buy Subscription* to get access.", parse_mode=ParseMode.MARKDOWN)
     else:
         await cq.message.answer(
             f"📦 *My Plan*\n"
@@ -259,13 +277,13 @@ async def on_my_plan(cq: types.CallbackQuery):
             f"Start: {fmt_dt(r['start_at'])}\n"
             f"End:   {fmt_dt(r['end_at'])}\n"
             f"Status: {r['status']}",
-            parse_mode="Markdown"
+            parse_mode=ParseMode.MARKDOWN
         )
     await cq.answer()
 
 @dp.callback_query(F.data == "menu:support")
 async def on_support(cq: types.CallbackQuery):
-    await bot.send_message(cq.from_user.id, "📞 Please type your question/issue. I’ll forward it to support.")
+    await bot.send_message(cq.from_user.id, "📞 Please type your question/issue. I'll forward it to support.")
     await cq.answer()
 
 @dp.message(F.text & (F.from_user.id != ADMIN_ID))
@@ -274,22 +292,35 @@ async def on_user_text(m: types.Message):
         return
     upsert_user(m.from_user)
     tid = add_ticket(m.from_user.id, m.text)
+    
+    # Safe escaping for user input
+    username = safe_escape(m.from_user.username or "")
+    user_text = safe_escape(m.text)
+    
     await bot.send_message(
         ADMIN_ID,
-        f"📩 *Support Ticket #{tid}*\nUser: @{m.from_user.username or m.from_user.id} (`{m.from_user.id}`)\n\n{m.text}",
-        parse_mode="Markdown"
+        f"📩 *Support Ticket #{tid}*\n"
+        f"User: @{username} (`{m.from_user.id}`)\n\n"
+        f"{user_text}",
+        parse_mode=ParseMode.MARKDOWN
     )
     await m.answer(f"✅ Sent to support. Ticket ID: #{tid}")
 
+# FIXED: Payment proof handler with proper escaping
 @dp.message(F.photo & (F.from_user.id != ADMIN_ID))
 async def on_payment_photo(m: types.Message):
     plan_key = last_selected_plan.get(m.from_user.id, "plan1")
     pid = add_payment(m.from_user.id, plan_key, m.photo[-1].file_id)
+    
+    # Safe escaping for username and plan name
+    username = safe_escape(m.from_user.username or "")
+    plan_name = safe_escape(PLANS[plan_key]['name'])
+    
     await bot.send_message(
         ADMIN_ID,
-        f"💵 *Payment Proof #{pid}* from `{m.from_user.id}` (@{m.from_user.username or '-'})\n"
-        f"Selected: {PLANS[plan_key]['name']}",
-        parse_mode="Markdown"
+        f"💵 *Payment Proof #{pid}* from `{m.from_user.id}` (@{username})\n"
+        f"Selected: {plan_name}",
+        parse_mode=ParseMode.MARKDOWN
     )
     await bot.send_photo(ADMIN_ID, m.photo[-1].file_id, reply_markup=kb_payment_actions(pid, m.from_user.id))
     await m.answer("✅ Screenshot received. Admin will review shortly.")
@@ -310,8 +341,9 @@ async def admin_pending(cq: types.CallbackQuery):
         await cq.message.answer("✅ No pending payments.")
         await cq.answer(); return
     for r in rows:
-        cap = f"💵 Payment #{r['id']} from `{r['user_id']}` (pending)\nSelected: {PLANS[r['plan_key']]['name']}"
-        await cq.message.answer(cap, reply_markup=kb_payment_actions(r["id"], r["user_id"]))
+        plan_name = safe_escape(PLANS[r['plan_key']]['name'])
+        cap = f"💵 Payment #{r['id']} from `{r['user_id']}` (pending)\nSelected: {plan_name}"
+        await cq.message.answer(cap, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_payment_actions(r["id"], r["user_id"]))
     await cq.answer()
 
 @dp.callback_query(F.data.startswith("admin:approve:"))
@@ -361,8 +393,9 @@ async def admin_users(cq: types.CallbackQuery):
     lines = []
     for r in rows:
         plan = PLANS.get(r["plan_key"], {"name": "—"})["name"] if r["plan_key"] else "—"
-        lines.append(f"`{r['user_id']}` @{r['username'] or '-'} | {plan} | {fmt_dt(r['end_at'])} | {r['status']}")
-    await cq.message.answer("👥 *Users (top 50)*\n" + "\n".join(lines), parse_mode="Markdown")
+        username = safe_escape(r['username'] or '')
+        lines.append(f"`{r['user_id']}` @{username} | {plan} | {fmt_dt(r['end_at'])} | {r['status']}")
+    await cq.message.answer("👥 *Users (top 50)*\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     await cq.answer()
 
 @dp.callback_query(F.data == "admin:stats")
@@ -372,7 +405,7 @@ async def admin_stats(cq: types.CallbackQuery):
     total, active, expired, pending = stats()
     await cq.message.answer(
         f"📊 *Stats*\nUsers: {total}\nActive: {active}\nExpired: {expired}\nPending payments: {pending}",
-        parse_mode="Markdown"
+        parse_mode=ParseMode.MARKDOWN
     )
     await cq.answer()
 
@@ -405,7 +438,7 @@ async def admin_reply_hint(cq: types.CallbackQuery):
     if not is_admin(cq.from_user.id):
         await cq.answer("Admins only.", show_alert=True); return
     uid = int(cq.data.split(":")[2])
-    await cq.message.answer(f"Reply with:\n`/reply {uid} <message>`", parse_mode="Markdown")
+    await cq.message.answer(f"Reply with:\n`/reply {uid} <message>`", parse_mode=ParseMode.MARKDOWN)
     await cq.answer()
 
 @dp.message(Command("reply"))

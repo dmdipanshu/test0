@@ -78,7 +78,7 @@ def is_admin(uid: int) -> bool:
 def safe_text(text) -> str:
     return str(text or "No info").replace("None", "No info")
 
-# Fixed Database Helper Functions
+# Database Helper Functions
 async def upsert_user(user: types.User):
     try:
         if users_col is not None:
@@ -100,7 +100,6 @@ async def upsert_user(user: types.User):
                 upsert=True
             )
         else:
-            # Fallback to memory
             if user.id not in memory_users:
                 memory_users[user.id] = {
                     "user_id": user.id,
@@ -140,7 +139,6 @@ async def set_subscription(user_id: int, plan_key: str, days: int):
                 }}
             )
         else:
-            # Update memory storage
             if user_id in memory_users:
                 memory_users[user_id].update({
                     "plan_key": plan_key,
@@ -167,7 +165,6 @@ async def add_payment(user_id: int, plan_key: str, file_id: str):
             })
             return str(result.inserted_id)
         else:
-            # Fallback to memory
             payment_counter += 1
             payment_id = str(payment_counter)
             memory_payments[payment_id] = {
@@ -191,7 +188,6 @@ async def set_payment_status(payment_id: str, status: str):
                 {"$set": {"status": status}}
             )
         else:
-            # Update memory storage
             if payment_id in memory_payments:
                 memory_payments[payment_id]["status"] = status
     except Exception as e:
@@ -271,17 +267,18 @@ def kb_payment_options(plan_key: str) -> InlineKeyboardMarkup:
         ]
     ])
 
+# Fixed payment actions keyboard with better callback data
 def kb_payment_actions(payment_id: str, user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ 1M", callback_data=f"admin:approve:{payment_id}:{user_id}:plan1"),
-            InlineKeyboardButton(text="✅ 6M", callback_data=f"admin:approve:{payment_id}:{user_id}:plan2")
+            InlineKeyboardButton(text="✅ 1M", callback_data=f"approve_{payment_id}_{user_id}_plan1"),
+            InlineKeyboardButton(text="✅ 6M", callback_data=f"approve_{payment_id}_{user_id}_plan2")
         ],
         [
-            InlineKeyboardButton(text="✅ 1Y", callback_data=f"admin:approve:{payment_id}:{user_id}:plan3"),
-            InlineKeyboardButton(text="✅ LT", callback_data=f"admin:approve:{payment_id}:{user_id}:plan4")
+            InlineKeyboardButton(text="✅ 1Y", callback_data=f"approve_{payment_id}_{user_id}_plan3"),
+            InlineKeyboardButton(text="✅ LT", callback_data=f"approve_{payment_id}_{user_id}_plan4")
         ],
-        [InlineKeyboardButton(text="❌ Deny", callback_data=f"admin:deny:{payment_id}:{user_id}")]
+        [InlineKeyboardButton(text="❌ Deny", callback_data=f"deny_{payment_id}_{user_id}")]
     ])
 
 def kb_admin_menu() -> InlineKeyboardMarkup:
@@ -552,16 +549,23 @@ async def on_payment_photo(m: types.Message):
         log.error(f"Error processing payment photo: {e}")
         await m.answer("❌ Error processing screenshot. Please try uploading again.")
 
-# Admin handlers
-@dp.callback_query(F.data.startswith("admin:approve:"))
+# Fixed admin handlers with better callback data parsing
+@dp.callback_query(F.data.startswith("approve_"))
 async def admin_approve(cq: types.CallbackQuery):
     if not is_admin(cq.from_user.id):
         await cq.answer("❌ Access denied!", show_alert=True)
         return
     
     try:
-        parts = cq.data.split(":")
-        payment_id, user_id, plan_key = parts[2], int(parts[1]), parts[2]
+        # Parse callback data: approve_payment_id_user_id_plan_key
+        parts = cq.data.split("_")
+        log.info(f"Parsing approve callback: {cq.data}, parts: {parts}")
+        
+        if len(parts) != 4:
+            await cq.answer("❌ Invalid callback data!", show_alert=True)
+            return
+            
+        payment_id, user_id, plan_key = parts[1], int(parts[2]), parts[1]
         
         await set_payment_status(payment_id, "approved")
         await set_subscription(user_id, plan_key, PLANS[plan_key]["days"])
@@ -586,22 +590,29 @@ async def admin_approve(cq: types.CallbackQuery):
             )
         
         await bot.send_message(user_id, user_msg, parse_mode=ParseMode.MARKDOWN)
-        await cq.message.answer(f"✅ Payment #{payment_id} approved!")
+        await cq.message.answer(f"✅ Payment #{payment_id} approved for {plan['name']}!")
         await cq.answer("✅ Approved!")
         
     except Exception as e:
         log.error(f"Error approving payment: {e}")
         await cq.answer("❌ Error processing approval!", show_alert=True)
 
-@dp.callback_query(F.data.startswith("admin:deny:"))
+@dp.callback_query(F.data.startswith("deny_"))
 async def admin_deny(cq: types.CallbackQuery):
     if not is_admin(cq.from_user.id):
         await cq.answer("❌ Access denied!", show_alert=True)
         return
     
     try:
-        parts = cq.data.split(":")
-        payment_id, user_id = parts[2], int(parts[1])
+        # Parse callback data: deny_payment_id_user_id
+        parts = cq.data.split("_")
+        log.info(f"Parsing deny callback: {cq.data}, parts: {parts}")
+        
+        if len(parts) != 3:
+            await cq.answer("❌ Invalid callback data!", show_alert=True)
+            return
+            
+        payment_id, user_id = parts[1], int(parts[2])
         
         await set_payment_status(payment_id, "denied")
         
@@ -652,7 +663,7 @@ async def admin_reply(m: types.Message):
             await m.answer("❌ Usage: `/reply <user_id> <message>`")
             return
         
-        user_id, reply_text = int(parts[1]), parts[3]
+        user_id, reply_text = int(parts[1]), parts[2]
         
         user_msg = f"💬 **Support Response**\n\n{reply_text}\n\n─────────────\n🎧 Premium Support"
         await bot.send_message(user_id, user_msg, parse_mode=ParseMode.MARKDOWN)

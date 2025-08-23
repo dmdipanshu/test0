@@ -1,24 +1,14 @@
-import asyncio
 import logging
 import os
-import sqlite3
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict
-
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command, CommandStart
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
+from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import CommandStart
 
 # ───────────────────────── Logging ─────────────────────────
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("subbot")
 
-# ───────────────────────── Config ─────────────────────────
-import os
-
+# ───────────────────────── Config from Environment ─────────────────────────
 def load_config() -> dict:
     cfg = {
         "API_TOKEN": os.getenv("API_TOKEN"),
@@ -28,18 +18,12 @@ def load_config() -> dict:
         "QR_CODE_URL": os.getenv("QR_CODE_URL"),
     }
 
-    # Check for missing variables
     missing = [k for k, v in cfg.items() if not v]
     if missing:
         raise ValueError(f"Missing environment variables: {', '.join(missing)}")
 
-    # Convert numeric IDs to int
-    try:
-        cfg["ADMIN_ID"] = int(cfg["ADMIN_ID"])
-        cfg["CHANNEL_ID"] = int(cfg["CHANNEL_ID"])
-    except ValueError:
-        raise ValueError("ADMIN_ID and CHANNEL_ID must be integers")
-
+    cfg["ADMIN_ID"] = int(cfg["ADMIN_ID"])
+    cfg["CHANNEL_ID"] = int(cfg["CHANNEL_ID"])
     return cfg
 
 cfg = load_config()
@@ -49,7 +33,9 @@ CHANNEL_ID = cfg["CHANNEL_ID"]
 UPI_ID = cfg["UPI_ID"]
 QR_CODE_URL = cfg["QR_CODE_URL"]
 
-    
+# ───────────────────────── Bot & Dispatcher ─────────────────────────
+bot = Bot(API_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 
 # ───────────────────────── Plans ─────────────────────────
 PLANS = {

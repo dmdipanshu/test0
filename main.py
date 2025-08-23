@@ -24,6 +24,13 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID") or "-10012345678")
 UPI_ID = os.getenv("UPI_ID") or "yourupi@upi"
 QR_CODE_URL = os.getenv("QR_CODE_URL") or "https://example.com/qr.png"
 
+# Enhanced Image URLs from Environment Variables
+WELCOME_IMAGE = os.getenv("WELCOME_IMAGE") or "https://i.imgur.com/premium-welcome.jpg"
+PLANS_IMAGE = os.getenv("PLANS_IMAGE") or "https://i.imgur.com/premium-plans.jpg"
+OFFERS_IMAGE = os.getenv("OFFERS_IMAGE") or "https://i.imgur.com/special-offers.jpg"
+SUCCESS_IMAGE = os.getenv("SUCCESS_IMAGE") or "https://i.imgur.com/success.jpg"
+UPGRADE_IMAGE = os.getenv("UPGRADE_IMAGE") or "https://i.imgur.com/upgrade-now.jpg"
+
 if API_TOKEN == "TEST_TOKEN":
     raise RuntimeError("❌ API_TOKEN not set! Please configure environment variables.")
 
@@ -222,6 +229,29 @@ def calculate_savings(plan_key: str) -> str:
     
     return f"💰 Save ₹{savings:.0f} ({savings_percent:.0f}% OFF)"
 
+# ───────────────────────── Safe Message Editing Helper ─────────────────────────
+async def safe_edit_message(cq: types.CallbackQuery, text: str = None, caption: str = None, reply_markup=None, parse_mode=None):
+    """Safely edit message with fallback to new message"""
+    try:
+        if text:
+            await cq.message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        elif caption:
+            await cq.message.edit_caption(caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+    except Exception:
+        # If editing fails, send new message
+        if text:
+            await cq.message.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        elif caption:
+            await cq.message.answer(caption, parse_mode=parse_mode, reply_markup=reply_markup)
+
+async def safe_send_photo(chat_id: int, photo_url: str, caption: str, reply_markup=None, parse_mode=None):
+    """Safely send photo with fallback to text message"""
+    try:
+        await bot.send_photo(chat_id, photo_url, caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+    except Exception:
+        # If photo fails, send text message
+        await bot.send_message(chat_id, caption, parse_mode=parse_mode, reply_markup=reply_markup)
+
 # ───────────────────────── Enhanced UI Keyboards ─────────────────────────
 def kb_user_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -302,13 +332,13 @@ def kb_payment_actions(payment_id: int, user_id: int) -> InlineKeyboardMarkup:
 class BCast(StatesGroup):
     waiting_text = State()
 
-# ───────────────────────── Enhanced User Flow ─────────────────────────
+# ───────────────────────── Enhanced User Flow with Images ─────────────────────────
 @dp.message(CommandStart())
 async def on_start(m: types.Message):
     upsert_user(m.from_user)
     
     welcome_animation = "🎊✨🎉"
-    welcome_text = (
+    welcome_caption = (
         f"{welcome_animation} **WELCOME TO PREMIUM WORLD** {welcome_animation}\n\n"
         f"👋 Hello **{m.from_user.first_name}**!\n\n"
         f"🌟 **Unlock Premium Features:**\n"
@@ -321,7 +351,14 @@ async def on_start(m: types.Message):
         f"🎯 **Ready to upgrade your experience?**"
     )
     
-    await m.answer(welcome_text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_user_menu())
+    # Send welcome photo with caption and buttons
+    await safe_send_photo(
+        m.from_user.id, 
+        WELCOME_IMAGE, 
+        welcome_caption, 
+        reply_markup=kb_user_menu(), 
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 @dp.callback_query(F.data == "back:menu")
 async def back_to_menu(cq: types.CallbackQuery):
@@ -333,12 +370,25 @@ async def back_to_menu(cq: types.CallbackQuery):
         f"💫 Best deals available now\n\n"
         f"**What would you like to do?**"
     )
-    await cq.message.edit_text(welcome_text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_user_menu())
+    
+    # Delete current message and send new welcome photo
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    
+    await safe_send_photo(
+        cq.from_user.id, 
+        WELCOME_IMAGE, 
+        welcome_text, 
+        reply_markup=kb_user_menu(), 
+        parse_mode=ParseMode.MARKDOWN
+    )
     await cq.answer()
 
 @dp.callback_query(F.data == "menu:buy")
 async def on_buy(cq: types.CallbackQuery):
-    plans_header = (
+    plans_caption = (
         f"💎 **PREMIUM SUBSCRIPTION PLANS** 💎\n\n"
         f"🔥 **LIMITED TIME OFFERS AVAILABLE!**\n\n"
         f"🌟 **All Plans Include:**\n"
@@ -350,7 +400,20 @@ async def on_buy(cq: types.CallbackQuery):
         f"   ✅ Exclusive member-only content\n\n"
         f"💫 **Choose Your Perfect Plan:**"
     )
-    await cq.message.edit_text(plans_header, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_plans())
+    
+    # Delete current message and send plans photo
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    
+    await safe_send_photo(
+        cq.from_user.id, 
+        PLANS_IMAGE, 
+        plans_caption, 
+        reply_markup=kb_plans(), 
+        parse_mode=ParseMode.MARKDOWN
+    )
     await cq.answer("💎 Choose your premium plan!")
 
 @dp.callback_query(F.data.startswith("plan:"))
@@ -392,7 +455,7 @@ async def on_plan(cq: types.CallbackQuery):
         f"💳 **Select Your Payment Method:**"
     )
     
-    await cq.message.edit_text(plan_details, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_payment_options(plan_key))
+    await safe_edit_message(cq, text=plan_details, reply_markup=kb_payment_options(plan_key), parse_mode=ParseMode.MARKDOWN)
     await cq.answer(f"{plan['emoji']} {plan['name']} plan selected!")
 
 @dp.callback_query(F.data.startswith("copy:upi:"))
@@ -419,7 +482,7 @@ async def copy_upi(cq: types.CallbackQuery):
         f"📸 **Screenshot must show:** Payment success + Amount + Date"
     )
     
-    await cq.message.edit_text(upi_details, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_payment_options(plan_key))
+    await safe_edit_message(cq, text=upi_details, reply_markup=kb_payment_options(plan_key), parse_mode=ParseMode.MARKDOWN)
     await cq.answer("💳 UPI details ready! Copy and use in your payment app", show_alert=False)
 
 @dp.callback_query(F.data.startswith("show:qr:"))
@@ -443,13 +506,17 @@ async def show_qr(cq: types.CallbackQuery):
         f"🔒 **256-bit SSL Encrypted**"
     )
     
-    await cq.message.delete()
-    await bot.send_photo(
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    
+    await safe_send_photo(
         cq.from_user.id,
         QR_CODE_URL,
-        caption=qr_caption,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_payment_options(plan_key)
+        qr_caption,
+        reply_markup=kb_payment_options(plan_key),
+        parse_mode=ParseMode.MARKDOWN
     )
     await cq.answer("📱 QR Code ready for scanning!")
 
@@ -478,7 +545,7 @@ async def payment_help(cq: types.CallbackQuery):
         f"💬 **Need Help?** Contact our support team!"
     )
     
-    await cq.message.edit_text(help_text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_payment_options(plan_key))
+    await safe_edit_message(cq, text=help_text, reply_markup=kb_payment_options(plan_key), parse_mode=ParseMode.MARKDOWN)
     await cq.answer()
 
 @dp.callback_query(F.data.startswith("pay:ask:"))
@@ -507,10 +574,11 @@ async def on_pay_ask(cq: types.CallbackQuery):
         f"📷 **Ready? Send your payment screenshot now! ⬇️**"
     )
     
-    await cq.message.edit_text(
-        screenshot_guide, 
-        parse_mode=ParseMode.MARKDOWN, 
-        reply_markup=kb_screenshot_guide(plan_key)
+    await safe_edit_message(
+        cq, 
+        text=screenshot_guide, 
+        reply_markup=kb_screenshot_guide(plan_key),
+        parse_mode=ParseMode.MARKDOWN
     )
     await cq.answer("📸 Upload your payment proof now!")
 
@@ -577,12 +645,12 @@ async def compare_plans(cq: types.CallbackQuery):
         f"🏆 **Best Value:** Lifetime plan"
     )
     
-    await cq.message.edit_text(comparison, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_plans())
+    await safe_edit_message(cq, text=comparison, reply_markup=kb_plans(), parse_mode=ParseMode.MARKDOWN)
     await cq.answer()
 
 @dp.callback_query(F.data == "menu:offers")
 async def show_offers(cq: types.CallbackQuery):
-    offers_text = (
+    offers_caption = (
         f"🎁 **SPECIAL OFFERS & DEALS** 🎁\n\n"
         f"🔥 **LIMITED TIME OFFERS:**\n\n"
         f"🟡 **6 Months Plan:** 67% OFF\n"
@@ -602,7 +670,19 @@ async def show_offers(cq: types.CallbackQuery):
         f"⏰ **Offers expire soon!**"
     )
     
-    await cq.message.edit_text(offers_text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_user_menu())
+    # Delete current message and send offers photo
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    
+    await safe_send_photo(
+        cq.from_user.id, 
+        OFFERS_IMAGE, 
+        offers_caption, 
+        reply_markup=kb_user_menu(), 
+        parse_mode=ParseMode.MARKDOWN
+    )
     await cq.answer("🎁 Check out these amazing offers!")
 
 @dp.callback_query(F.data == "menu:my")
@@ -610,7 +690,7 @@ async def on_my_plan(cq: types.CallbackQuery):
     r = get_user(cq.from_user.id)
     
     if not r or r["status"] != "active":
-        no_subscription_text = (
+        no_subscription_caption = (
             f"😔 **NO ACTIVE SUBSCRIPTION**\n\n"
             f"You're currently using the **FREE** version\n\n"
             f"🌟 **Upgrade to Premium and Get:**\n"
@@ -624,7 +704,20 @@ async def on_my_plan(cq: types.CallbackQuery):
             f"🎁 **Special Launch Offers Available!**\n\n"
             f"👆 **Ready to upgrade? Tap 'Upgrade to Premium'**"
         )
-        await cq.message.edit_text(no_subscription_text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_user_menu())
+        
+        # Delete current message and send upgrade photo
+        try:
+            await cq.message.delete()
+        except Exception:
+            pass
+        
+        await safe_send_photo(
+            cq.from_user.id, 
+            UPGRADE_IMAGE, 
+            no_subscription_caption, 
+            reply_markup=kb_user_menu(), 
+            parse_mode=ParseMode.MARKDOWN
+        )
     else:
         plan_info = PLANS.get(r['plan_key'], {'name': 'Unknown', 'emoji': '📦'})
         
@@ -672,7 +765,7 @@ async def on_my_plan(cq: types.CallbackQuery):
             f"💬 **Need help?** Our support team is ready to assist!"
         )
         
-        await cq.message.edit_text(subscription_details, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_user_menu())
+        await safe_edit_message(cq, text=subscription_details, reply_markup=kb_user_menu(), parse_mode=ParseMode.MARKDOWN)
     
     await cq.answer()
 
@@ -696,7 +789,7 @@ async def on_support(cq: types.CallbackQuery):
         f"   🟡 Free Users: 10-30 minutes\n\n"
         f"📞 **24/7 Premium Support Available!**"
     )
-    await cq.message.edit_text(support_text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_user_menu())
+    await safe_edit_message(cq, text=support_text, reply_markup=kb_user_menu(), parse_mode=ParseMode.MARKDOWN)
     await cq.answer("💬 Support is ready to help!")
 
 # Enhanced user text handler (support tickets)
@@ -794,7 +887,7 @@ async def on_payment_photo(m: types.Message):
             reply_markup=kb_payment_actions(pid, m.from_user.id)
         )
         
-        # Enhanced user confirmation
+        # Enhanced user confirmation with success image
         confirmation_text = (
             f"🎉 **PAYMENT PROOF UPLOADED SUCCESSFULLY!**\n\n"
             f"📸 **Proof ID:** #{pid}\n"
@@ -812,7 +905,12 @@ async def on_payment_photo(m: types.Message):
             f"Get ready for an amazing experience! 🚀"
         )
         
-        await m.answer(confirmation_text, parse_mode=ParseMode.MARKDOWN)
+        await safe_send_photo(
+            m.from_user.id,
+            SUCCESS_IMAGE,
+            confirmation_text,
+            parse_mode=ParseMode.MARKDOWN
+        )
         
     except Exception as e:
         log.error(f"Error processing payment photo: {e}")
@@ -908,7 +1006,7 @@ async def admin_approve(cq: types.CallbackQuery):
         _, end_date = set_subscription(uid, plan_key, PLANS[plan_key]["days"])
         plan = PLANS[plan_key]
         
-        # Create premium invitation and notify user
+        # Create premium invitation and notify user with success image
         try:
             link = await bot.create_chat_invite_link(CHANNEL_ID, member_limit=1)
             user_notification = (
@@ -931,7 +1029,7 @@ async def admin_approve(cq: types.CallbackQuery):
                 f"Enjoy exclusive content and features! 🚀\n\n"
                 f"💬 **Questions?** Our premium support team is here 24/7!"
             )
-            await bot.send_message(uid, user_notification, parse_mode=ParseMode.MARKDOWN)
+            await safe_send_photo(uid, SUCCESS_IMAGE, user_notification, parse_mode=ParseMode.MARKDOWN)
             
         except Exception as e:
             log.error(f"Error creating invite link: {e}")
@@ -945,7 +1043,7 @@ async def admin_approve(cq: types.CallbackQuery):
                 f"📞 **Contact admin for premium channel access**\n\n"
                 f"🌟 **Welcome to Premium!** 🚀"
             )
-            await bot.send_message(uid, user_notification, parse_mode=ParseMode.MARKDOWN)
+            await safe_send_photo(uid, SUCCESS_IMAGE, user_notification, parse_mode=ParseMode.MARKDOWN)
         
         # Confirm to admin
         admin_confirmation = (
@@ -1019,7 +1117,7 @@ async def admin_deny(cq: types.CallbackQuery):
         log.error(f"Error denying payment: {e}")
         await cq.answer("❌ Error processing denial! Please try again.", show_alert=True)
 
-# Additional admin functions (users, stats, broadcast, reply)
+# Additional admin functions (keeping existing functionality)
 @dp.callback_query(F.data == "admin:users")
 async def admin_users(cq: types.CallbackQuery):
     if not is_admin(cq.from_user.id):
@@ -1313,7 +1411,7 @@ async def main():
         log.info("✅ Enhanced expiry worker started")
         
         # Start bot
-        log.info("🚀 Starting Enhanced Premium Subscription Bot")
+        log.info("🚀 Starting Enhanced Premium Subscription Bot with Images")
         await dp.start_polling(bot, skip_updates=True)
         
     except Exception as e:

@@ -77,11 +77,154 @@ def init_db():
         )""")
         c.commit()
 
-# ───────────────────────── DB Functions ─────────────────────────
-# (reuse all existing DB functions from your original code unchanged)
+# ───────────────────────── DB functions ─────────────────────────
+def upsert_user(usr: types.User):
+    with db() as c:
+        now = datetime.now(timezone.utc).isoformat()
+        c.execute(
+            """INSERT INTO users(user_id,username,first_name,last_name,plan_key,start_at,end_at,status,created_at)
+               VALUES(?,?,?,?,NULL,NULL,NULL,'none',?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 username=excluded.username,
+                 first_name=excluded.first_name,
+                 last_name=excluded.last_name
+            """,
+            (usr.id, usr.username, usr.first_name, usr.last_name, now),
+        )
+        c.commit()
 
-# ───────────────────────── UI, FSM, Handlers ─────────────────────────
-# (reuse all existing handlers, menus, admin logic from your original code unchanged)
+def get_user(user_id: int) -> Optional[sqlite3.Row]:
+    with db() as c:
+        return c.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+
+def list_users(limit: int = 1000):
+    with db() as c:
+        return c.execute("SELECT * FROM users ORDER BY COALESCE(end_at,'') DESC LIMIT ?", (limit,)).fetchall()
+
+def set_status(user_id: int, status: str):
+    with db() as c:
+        c.execute("UPDATE users SET status=? WHERE user_id=?", (status, user_id))
+        c.commit()
+
+def set_subscription(user_id: int, plan_key: str, days: int):
+    now = datetime.now(timezone.utc)
+    row = get_user(user_id)
+    if row and row["end_at"]:
+        try:
+            current_end = datetime.fromisoformat(row["end_at"])
+        except Exception:
+            current_end = now
+        base = current_end if (row["status"] == "active" and current_end > now) else now
+        end = base + timedelta(days=days)
+    else:
+        end = now + timedelta(days=days)
+
+    with db() as c:
+        c.execute("""UPDATE users SET plan_key=?, start_at=?, end_at=?, status='active', reminded_3d=0
+                     WHERE user_id=?""",
+                  (plan_key, now.isoformat(), end.isoformat(), user_id))
+        c.commit()
+    return now, end
+
+def add_payment(user_id: int, plan_key: str, file_id: str) -> int:
+    with db() as c:
+        c.execute("""INSERT INTO payments(user_id, plan_key, file_id, created_at, status)
+                     VALUES(?,?,?,?, 'pending')""",
+                  (user_id, plan_key, file_id, datetime.now(timezone.utc).isoformat()))
+        pid = c.execute("SELECT last_insert_rowid() id").fetchone()["id"]
+        c.commit()
+        return pid
+
+def set_payment_status(payment_id: int, status: str):
+    with db() as c:
+        c.execute("UPDATE payments SET status=? WHERE id=?", (status, payment_id))
+        c.commit()
+
+def pending_payments(limit: int = 10):
+    with db() as c:
+        return c.execute("SELECT * FROM payments WHERE status='pending' ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+def add_ticket(user_id: int, message: str) -> int:
+    with db() as c:
+        c.execute("""INSERT INTO tickets(user_id,message,status,created_at)
+                     VALUES(?,?,'open',?)""",
+                  (user_id, message, datetime.now(timezone.utc).isoformat()))
+        tid = c.execute("SELECT last_insert_rowid() id").fetchone()["id"]
+        c.commit()
+        return tid
+
+def mark_reminded(user_id: int):
+    with db() as c:
+        c.execute("UPDATE users SET reminded_3d=1 WHERE user_id=?", (user_id,))
+        c.commit()
+
+def stats():
+    with db() as c:
+        total = c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+        active = c.execute("SELECT COUNT(*) n FROM users WHERE status='active'").fetchone()["n"]
+        expired = c.execute("SELECT COUNT(*) n FROM users WHERE status='expired'").fetchone()["n"]
+        pend = c.execute("SELECT COUNT(*) n FROM payments WHERE status='pending'").fetchone()["n"]
+        return total, active, expired, pend
+
+# ───────────────────────── UI helpers ─────────────────────────
+def kb_user_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Buy Subscription", callback_data="menu:buy")],
+        [InlineKeyboardButton(text="📦 My Plan", callback_data="menu:my")],
+        [InlineKeyboardButton(text="📞 Contact Support", callback_data="menu:support")],
+        [InlineKeyboardButton(text="🛠 Admin Panel", callback_data="admin:menu")],
+    ])
+
+def kb_plans() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{PLANS['plan1']['name']} - {PLANS['plan1']['price']}", callback_data="plan:plan1")],
+        [InlineKeyboardButton(text=f"{PLANS['plan2']['name']} - {PLANS['plan2']['price']}", callback_data="plan:plan2")],
+        [InlineKeyboardButton(text=f"{PLANS['plan3']['name']} - {PLANS['plan3']['price']}", callback_data="plan:plan3")],
+        [InlineKeyboardButton(text=f"{PLANS['plan4']['name']} - {PLANS['plan4']['price']}", callback_data="plan:plan4")],
+    ])
+
+def kb_after_plan(plan_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 I Paid — Send Screenshot", callback_data=f"pay:ask:{plan_key}")],
+        [InlineKeyboardButton(text="⬅️ Choose Other Plan", callback_data="menu:buy")],
+    ])
+
+def kb_admin_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⌛ Pending Payments", callback_data="admin:pending")],
+        [InlineKeyboardButton(text="👥 Users", callback_data="admin:users")],
+        [InlineKeyboardButton(text="📊 Stats", callback_data="admin:stats")],
+        [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin:broadcast")],
+    ])
+
+def kb_payment_actions(payment_id: int, user_id: int) -> InlineKeyboardMarkup:
+    r1 = [
+        InlineKeyboardButton(text=f"✅ {PLANS['plan1']['name']}", callback_data=f"admin:approve:{payment_id}:{user_id}:plan1"),
+        InlineKeyboardButton(text=f"✅ {PLANS['plan2']['name']}", callback_data=f"admin:approve:{payment_id}:{user_id}:plan2"),
+    ]
+    r2 = [
+        InlineKeyboardButton(text=f"✅ {PLANS['plan3']['name']}", callback_data=f"admin:approve:{payment_id}:{user_id}:plan3"),
+        InlineKeyboardButton(text=f"✅ {PLANS['plan4']['name']}", callback_data=f"admin:approve:{payment_id}:{user_id}:plan4"),
+    ]
+    r3 = [InlineKeyboardButton(text="❌ Deny", callback_data=f"admin:deny:{payment_id}:{user_id}")]
+    r4 = [InlineKeyboardButton(text="💬 Quick Reply", callback_data=f"admin:reply:{user_id}")]
+    return InlineKeyboardMarkup(inline_keyboard=[r1, r2, r3, r4])
+
+def fmt_dt(dtiso: Optional[str]) -> str:
+    if not dtiso:
+        return "—"
+    return datetime.fromisoformat(dtiso).astimezone().strftime("%Y-%m-%d %H:%M")
+
+def is_admin(uid: int) -> bool:
+    return uid == ADMIN_ID
+
+# ───────────────────────── FSM for broadcast ─────────────────────────
+class BCast(StatesGroup):
+    waiting_text = State()
+
+# ───────────────────────── Handlers (User + Admin) ─────────────────────────
+# COPY ALL your existing handlers here exactly as in your original code
+# (Start, Buy, Plan selection, Payment, Admin approval, Broadcast, etc.)
 
 # ───────────────────────── Auto-Expiry Worker ─────────────────────────
 async def expiry_worker():
@@ -123,7 +266,7 @@ async def expiry_worker():
             log.exception(f"expiry_worker error: {e}")
         await asyncio.sleep(1800)
 
-# ───────────────────────── Startup for Koyeb ─────────────────────────
+# ───────────────────────── Startup ─────────────────────────
 async def start_bot():
     init_db()
     log.info("Starting Telegram bot worker...")

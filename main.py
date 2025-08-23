@@ -17,38 +17,39 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("subbot")
 
 # ───────────────────────── Config ─────────────────────────
-CONFIG_PATH = "config.txt"
+import os
 
-def load_config(path: str = CONFIG_PATH) -> dict:
-    if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("API_TOKEN=YOUR_BOT_TOKEN\n")
-            f.write("ADMIN_ID=123456789\n")
-            f.write("CHANNEL_ID=-100123456789\n")
-            f.write("UPI_ID=yourupi@upi\n")
-            f.write("QR_CODE_URL=https://example.com/qr.png\n")
-        raise FileNotFoundError(f"{path} created. Fill it and run again.")
-    cfg = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if "=" in line:
-                k, v = line.strip().split("=", 1)
-                cfg[k.strip()] = v.strip()
-    required = ["API_TOKEN", "ADMIN_ID", "CHANNEL_ID", "UPI_ID", "QR_CODE_URL"]
-    miss = [k for k in required if k not in cfg or not cfg[k]]
-    if miss:
-        raise ValueError(f"Missing in {path}: {', '.join(miss)}")
+def load_config() -> dict:
+    cfg = {
+        "API_TOKEN": os.getenv("API_TOKEN"),
+        "ADMIN_ID": os.getenv("ADMIN_ID"),
+        "CHANNEL_ID": os.getenv("CHANNEL_ID"),
+        "UPI_ID": os.getenv("UPI_ID"),
+        "QR_CODE_URL": os.getenv("QR_CODE_URL"),
+    }
+
+    # Check for missing variables
+    missing = [k for k, v in cfg.items() if not v]
+    if missing:
+        raise ValueError(f"Missing environment variables: {', '.join(missing)}")
+
+    # Convert numeric IDs to int
+    try:
+        cfg["ADMIN_ID"] = int(cfg["ADMIN_ID"])
+        cfg["CHANNEL_ID"] = int(cfg["CHANNEL_ID"])
+    except ValueError:
+        raise ValueError("ADMIN_ID and CHANNEL_ID must be integers")
+
     return cfg
 
 cfg = load_config()
 API_TOKEN = cfg["API_TOKEN"]
-ADMIN_ID = int(cfg["ADMIN_ID"])
-CHANNEL_ID = int(cfg["CHANNEL_ID"])
+ADMIN_ID = cfg["ADMIN_ID"]
+CHANNEL_ID = cfg["CHANNEL_ID"]
 UPI_ID = cfg["UPI_ID"]
 QR_CODE_URL = cfg["QR_CODE_URL"]
 
-bot = Bot(API_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+    
 
 # ───────────────────────── Plans ─────────────────────────
 PLANS = {

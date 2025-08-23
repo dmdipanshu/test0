@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 from bson import ObjectId
+from bson.errors import InvalidId
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
@@ -180,18 +181,43 @@ async def add_payment(user_id: int, plan_key: str, file_id: str):
         log.error(f"Error adding payment: {e}")
         raise
 
+# Fixed payment status function with better error handling
 async def set_payment_status(payment_id: str, status: str):
     try:
         if payments_col is not None:
-            await payments_col.update_one(
-                {"_id": ObjectId(payment_id)},
-                {"$set": {"status": status}}
-            )
+            # Try to convert to ObjectId, handle both MongoDB ObjectId strings and simple strings
+            try:
+                # Check if it's a valid ObjectId
+                if len(payment_id) == 24:
+                    object_id = ObjectId(payment_id)
+                    result = await payments_col.update_one(
+                        {"_id": object_id},
+                        {"$set": {"status": status}}
+                    )
+                else:
+                    # Fallback for non-ObjectId strings
+                    result = await payments_col.update_one(
+                        {"_id": payment_id},
+                        {"$set": {"status": status}}
+                    )
+                
+                if result.modified_count == 0:
+                    log.warning(f"No payment found with ID: {payment_id}")
+                else:
+                    log.info(f"Payment {payment_id} status updated to {status}")
+                    
+            except InvalidId:
+                # Handle invalid ObjectId, try as string
+                result = await payments_col.update_one(
+                    {"_id": payment_id},
+                    {"$set": {"status": status}}
+                )
         else:
             if payment_id in memory_payments:
                 memory_payments[payment_id]["status"] = status
     except Exception as e:
         log.error(f"Error setting payment status: {e}")
+        raise
 
 async def get_stats():
     try:
@@ -267,7 +293,6 @@ def kb_payment_options(plan_key: str) -> InlineKeyboardMarkup:
         ]
     ])
 
-# Fixed payment actions keyboard with better callback data
 def kb_payment_actions(payment_id: str, user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -401,27 +426,34 @@ async def on_plan(cq: types.CallbackQuery):
     await safe_edit_message(cq, text=caption, reply_markup=kb_payment_options(plan_key))
     await cq.answer()
 
+# Enhanced UPI display with better highlighting
 @dp.callback_query(F.data.startswith("copy:upi:"))
 async def copy_upi(cq: types.CallbackQuery):
     plan_key = cq.data.split(":")[2]
     plan = PLANS[plan_key]
     
     text = (
-        f"💳 **UPI Payment**\n\n"
+        f"💳 **UPI PAYMENT GATEWAY**\n\n"
         f"🎯 **Plan:** {plan['emoji']} {plan['name']}\n"
         f"💰 **Amount:** {plan['price']}\n\n"
-        f"📋 **Payment Details:**\n"
-        f"UPI ID: `{UPI_ID}`\n"
-        f"Amount: `{plan['price'].replace('₹', '')}`\n\n"
-        f"💡 **Steps:**\n"
-        f"1. Copy UPI ID above\n"
-        f"2. Pay in your UPI app\n"
-        f"3. Upload screenshot here\n\n"
-        f"⚠️ Pay exact amount: **{plan['price']}**"
+        f"🔥 **HIGHLIGHTED PAYMENT DETAILS:**\n"
+        f"┏━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        f"┃ **UPI ID:** `{UPI_ID}` ┃\n"
+        f"┃ **Amount:** `{plan['price'].replace('₹', '')}` ┃\n"
+        f"┗━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
+        f"📱 **Quick Steps:**\n"
+        f"1️⃣ **Copy UPI ID** (tap above)\n"
+        f"2️⃣ **Open UPI App** (GPay/PhonePe)\n"
+        f"3️⃣ **Send Money** → Paste UPI ID\n"
+        f"4️⃣ **Enter Amount:** {plan['price'].replace('₹', '')}\n"
+        f"5️⃣ **Complete Payment**\n"
+        f"6️⃣ **Upload Screenshot** here\n\n"
+        f"⚠️ **Important:** Pay exactly **{plan['price']}**\n"
+        f"📸 **Screenshot must show:** Success + Amount + Date"
     )
     
     await safe_edit_message(cq, text=text, reply_markup=kb_payment_options(plan_key))
-    await cq.answer("💳 UPI details ready!")
+    await cq.answer("💳 UPI details highlighted! Copy and paste in your app", show_alert=True)
 
 @dp.callback_query(F.data.startswith("show:qr:"))
 async def show_qr(cq: types.CallbackQuery):
@@ -549,7 +581,7 @@ async def on_payment_photo(m: types.Message):
         log.error(f"Error processing payment photo: {e}")
         await m.answer("❌ Error processing screenshot. Please try uploading again.")
 
-# Fixed admin handlers with better callback data parsing
+# Fixed admin handlers
 @dp.callback_query(F.data.startswith("approve_"))
 async def admin_approve(cq: types.CallbackQuery):
     if not is_admin(cq.from_user.id):
@@ -557,7 +589,6 @@ async def admin_approve(cq: types.CallbackQuery):
         return
     
     try:
-        # Parse callback data: approve_payment_id_user_id_plan_key
         parts = cq.data.split("_")
         log.info(f"Parsing approve callback: {cq.data}, parts: {parts}")
         
@@ -566,6 +597,7 @@ async def admin_approve(cq: types.CallbackQuery):
             return
             
         payment_id, user_id, plan_key = parts[1], int(parts[2]), parts[1]
+        log.info(f"Processing approval for payment_id: {payment_id}, user_id: {user_id}, plan_key: {plan_key}")
         
         await set_payment_status(payment_id, "approved")
         await set_subscription(user_id, plan_key, PLANS[plan_key]["days"])
@@ -575,23 +607,28 @@ async def admin_approve(cq: types.CallbackQuery):
         try:
             link = await bot.create_chat_invite_link(CHANNEL_ID, member_limit=1)
             user_msg = (
-                f"🎉 **Payment Approved!**\n\n"
-                f"✅ Your {plan['emoji']} {plan['name']} subscription is active!\n"
-                f"💰 Amount: {plan['price']}\n\n"
+                f"🎉 **PAYMENT APPROVED!**\n\n"
+                f"✅ Your {plan['emoji']} {plan['name']} subscription is now **ACTIVE**!\n"
+                f"💰 Amount: {plan['price']}\n"
+                f"⏰ Valid for: {plan['days']} days\n\n"
                 f"🔗 **Join Premium Channel:**\n{link.invite_link}\n\n"
-                f"🌟 Welcome to Premium!"
+                f"🌟 **Welcome to Premium Family!**\n"
+                f"Enjoy unlimited access to all premium features! 🚀"
             )
-        except Exception:
+        except Exception as e:
+            log.error(f"Error creating invite link: {e}")
             user_msg = (
-                f"🎉 **Payment Approved!**\n\n"
-                f"✅ Your {plan['emoji']} {plan['name']} subscription is active!\n"
-                f"💰 Amount: {plan['price']}\n\n"
-                f"🌟 Welcome to Premium!"
+                f"🎉 **PAYMENT APPROVED!**\n\n"
+                f"✅ Your {plan['emoji']} {plan['name']} subscription is now **ACTIVE**!\n"
+                f"💰 Amount: {plan['price']}\n"
+                f"⏰ Valid for: {plan['days']} days\n\n"
+                f"🌟 **Welcome to Premium!**\n"
+                f"Contact admin for channel access."
             )
         
         await bot.send_message(user_id, user_msg, parse_mode=ParseMode.MARKDOWN)
-        await cq.message.answer(f"✅ Payment #{payment_id} approved for {plan['name']}!")
-        await cq.answer("✅ Approved!")
+        await cq.message.edit_text(f"✅ **Payment #{payment_id} APPROVED**\n\n{plan['emoji']} {plan['name']} activated for user {user_id}!", parse_mode=ParseMode.MARKDOWN)
+        await cq.answer("✅ Approved and activated!")
         
     except Exception as e:
         log.error(f"Error approving payment: {e}")
@@ -604,7 +641,6 @@ async def admin_deny(cq: types.CallbackQuery):
         return
     
     try:
-        # Parse callback data: deny_payment_id_user_id
         parts = cq.data.split("_")
         log.info(f"Parsing deny callback: {cq.data}, parts: {parts}")
         
@@ -613,20 +649,28 @@ async def admin_deny(cq: types.CallbackQuery):
             return
             
         payment_id, user_id = parts[1], int(parts[2])
+        log.info(f"Processing denial for payment_id: {payment_id}, user_id: {user_id}")
         
         await set_payment_status(payment_id, "denied")
         
         user_msg = (
-            f"❌ **Payment proof not approved**\n\n"
-            f"Please upload a clearer screenshot showing:\n"
-            f"• Payment success status\n"
-            f"• Exact amount\n"
-            f"• Transaction details"
+            f"❌ **Payment Proof Not Approved**\n\n"
+            f"Your payment screenshot for proof #{payment_id} could not be approved.\n\n"
+            f"🔍 **Common reasons:**\n"
+            f"• Screenshot not clear enough\n"
+            f"• Amount doesn't match plan price\n"
+            f"• Payment status not visible\n"
+            f"• Transaction details missing\n\n"
+            f"🔄 **What to do:**\n"
+            f"1. Take a clearer screenshot\n"
+            f"2. Ensure all details are visible\n"
+            f"3. Upload again\n\n"
+            f"💬 **Need help?** Contact support!"
         )
         
         await bot.send_message(user_id, user_msg, parse_mode=ParseMode.MARKDOWN)
-        await cq.message.answer(f"❌ Payment #{payment_id} denied.")
-        await cq.answer("❌ Denied!")
+        await cq.message.edit_text(f"❌ **Payment #{payment_id} DENIED**\n\nUser {user_id} has been notified with improvement suggestions.", parse_mode=ParseMode.MARKDOWN)
+        await cq.answer("❌ Denied with feedback sent!")
         
     except Exception as e:
         log.error(f"Error denying payment: {e}")
@@ -677,7 +721,6 @@ async def admin_reply(m: types.Message):
 async def main():
     log.info("🚀 Starting Premium Subscription Bot")
     
-    # Test MongoDB connection
     if mongo_client is not None:
         try:
             await mongo_client.admin.command('ping')
@@ -685,7 +728,6 @@ async def main():
         except Exception as e:
             log.warning(f"⚠️ MongoDB connection failed: {e}")
     
-    # Start bot
     await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":

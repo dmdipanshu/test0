@@ -12,11 +12,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# ───────────────────────── Logging ─────────────────────────
+# ───────── Logging & Config ─────────
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("subbot")
 
-# ───────────────────────── Config from ENV ─────────────────────────
 API_TOKEN = os.getenv("API_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-100123456789"))
@@ -24,12 +23,12 @@ UPI_ID = os.getenv("UPI_ID", "yourupi@upi")
 QR_CODE_URL = os.getenv("QR_CODE_URL", "https://example.com/qr.png")
 
 if not API_TOKEN:
-    raise RuntimeError("API_TOKEN is required in environment variables.")
+    raise RuntimeError("API_TOKEN is required in env.")
 
 bot = Bot(API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# ───────────────────────── Plans ─────────────────────────
+# ───────── Plans ─────────
 PLANS = {
     "plan1": {"name": "1 Month",  "price": "₹99",   "days": 30},
     "plan2": {"name": "6 Months", "price": "₹199",  "days": 180},
@@ -38,10 +37,10 @@ PLANS = {
 }
 last_selected_plan: Dict[int, str] = {}
 
-# ───────────────────────── SQLite Setup ─────────────────────────
+# ───────── DB Setup ─────────
 DB = "subs.db"
 
-def db() -> sqlite3.Connection:
+def db():
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     return conn
@@ -68,210 +67,182 @@ def init_db():
             created_at TEXT,
             status TEXT
         )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS tickets(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            message TEXT,
-            status TEXT,
-            created_at TEXT
-        )""")
         c.commit()
 
-# ───────────────────────── DB functions ─────────────────────────
-def upsert_user(usr: types.User):
+# ───────── DB Functions ─────────
+def upsert_user(u: types.User):
     with db() as c:
         now = datetime.now(timezone.utc).isoformat()
-        c.execute(
-            """INSERT INTO users(user_id,username,first_name,last_name,plan_key,start_at,end_at,status,created_at)
-               VALUES(?,?,?,?,NULL,NULL,NULL,'none',?)
-               ON CONFLICT(user_id) DO UPDATE SET
-                 username=excluded.username,
-                 first_name=excluded.first_name,
-                 last_name=excluded.last_name
-            """,
-            (usr.id, usr.username, usr.first_name, usr.last_name, now),
-        )
+        c.execute("""INSERT INTO users(user_id,username,first_name,last_name,status,created_at)
+                     VALUES(?,?,?,?, 'none', ?)
+                     ON CONFLICT(user_id) DO UPDATE SET
+                       username=excluded.username,
+                       first_name=excluded.first_name,
+                       last_name=excluded.last_name""",
+                  (u.id, u.username, u.first_name, u.last_name, now))
         c.commit()
 
-def get_user(user_id: int) -> Optional[sqlite3.Row]:
+def get_user(uid: int):
     with db() as c:
-        return c.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+        return c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
 
-def list_users(limit: int = 1000):
+def list_users(limit=1000):
     with db() as c:
         return c.execute("SELECT * FROM users ORDER BY COALESCE(end_at,'') DESC LIMIT ?", (limit,)).fetchall()
 
-def set_status(user_id: int, status: str):
-    with db() as c:
-        c.execute("UPDATE users SET status=? WHERE user_id=?", (status, user_id))
-        c.commit()
-
-def set_subscription(user_id: int, plan_key: str, days: int):
+def set_subscription(uid: int, plan_key: str, days: int):
     now = datetime.now(timezone.utc)
-    row = get_user(user_id)
+    row = get_user(uid)
     if row and row["end_at"]:
         try:
-            current_end = datetime.fromisoformat(row["end_at"])
-        except Exception:
-            current_end = now
-        base = current_end if (row["status"] == "active" and current_end > now) else now
+            end_old = datetime.fromisoformat(row["end_at"])
+        except:
+            end_old = now
+        base = end_old if (row["status"] == "active" and end_old > now) else now
         end = base + timedelta(days=days)
     else:
         end = now + timedelta(days=days)
 
     with db() as c:
-        c.execute("""UPDATE users SET plan_key=?, start_at=?, end_at=?, status='active', reminded_3d=0
-                     WHERE user_id=?""",
-                  (plan_key, now.isoformat(), end.isoformat(), user_id))
+        c.execute("""UPDATE users SET plan_key=?, start_at=?, end_at=?, status='active', reminded_3d=0 WHERE user_id=?""",
+                  (plan_key, now.isoformat(), end.isoformat(), uid))
         c.commit()
     return now, end
 
-def add_payment(user_id: int, plan_key: str, file_id: str) -> int:
+def add_payment(uid: int, plan_key: str, file_id: str):
     with db() as c:
-        c.execute("""INSERT INTO payments(user_id, plan_key, file_id, created_at, status)
-                     VALUES(?,?,?,?, 'pending')""",
-                  (user_id, plan_key, file_id, datetime.now(timezone.utc).isoformat()))
+        c.execute("""INSERT INTO payments(user_id,plan_key,file_id,created_at,status)
+                     VALUES(?,?,?,?,'pending')""",
+                  (uid, plan_key, file_id, datetime.now(timezone.utc).isoformat()))
         pid = c.execute("SELECT last_insert_rowid() id").fetchone()["id"]
         c.commit()
         return pid
 
-def set_payment_status(payment_id: int, status: str):
-    with db() as c:
-        c.execute("UPDATE payments SET status=? WHERE id=?", (status, payment_id))
-        c.commit()
-
-def pending_payments(limit: int = 10):
+def pending_payments(limit=10):
     with db() as c:
         return c.execute("SELECT * FROM payments WHERE status='pending' ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
-def add_ticket(user_id: int, message: str) -> int:
+def set_payment_status(pid: int, status: str):
     with db() as c:
-        c.execute("""INSERT INTO tickets(user_id,message,status,created_at)
-                     VALUES(?,?,'open',?)""",
-                  (user_id, message, datetime.now(timezone.utc).isoformat()))
-        tid = c.execute("SELECT last_insert_rowid() id").fetchone()["id"]
+        c.execute("UPDATE payments SET status=? WHERE id=?", (status, pid))
         c.commit()
-        return tid
 
-def mark_reminded(user_id: int):
+def mark_reminded(uid: int):
     with db() as c:
-        c.execute("UPDATE users SET reminded_3d=1 WHERE user_id=?", (user_id,))
+        c.execute("UPDATE users SET reminded_3d=1 WHERE user_id=?", (uid,))
         c.commit()
 
 def stats():
     with db() as c:
-        total = c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
-        active = c.execute("SELECT COUNT(*) n FROM users WHERE status='active'").fetchone()["n"]
-        expired = c.execute("SELECT COUNT(*) n FROM users WHERE status='expired'").fetchone()["n"]
-        pend = c.execute("SELECT COUNT(*) n FROM payments WHERE status='pending'").fetchone()["n"]
-        return total, active, expired, pend
+        t = c.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+        a = c.execute("SELECT COUNT(*) n FROM users WHERE status='active'").fetchone()["n"]
+        e = c.execute("SELECT COUNT(*) n FROM users WHERE status='expired'").fetchone()["n"]
+        p = c.execute("SELECT COUNT(*) n FROM payments WHERE status='pending'").fetchone()["n"]
+        return t, a, e, p
 
-# ───────────────────────── UI helpers ─────────────────────────
-def kb_user_menu() -> InlineKeyboardMarkup:
+# ───────── UI ─────────
+def kb_user():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Buy Subscription", callback_data="menu:buy")],
-        [InlineKeyboardButton(text="📦 My Plan", callback_data="menu:my")],
-        [InlineKeyboardButton(text="📞 Contact Support", callback_data="menu:support")],
-        [InlineKeyboardButton(text="🛠 Admin Panel", callback_data="admin:menu")],
+        [InlineKeyboardButton(text="💳 Buy Subscription", callback_data="buy")],
+        [InlineKeyboardButton(text="📦 My Plan", callback_data="my")],
+        [InlineKeyboardButton(text="📞 Support", callback_data="support")],
+        [InlineKeyboardButton(text="🛠 Admin", callback_data="admin")] if ADMIN_ID else []
     ])
 
-def kb_plans() -> InlineKeyboardMarkup:
+def kb_plans():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{PLANS['plan1']['name']} - {PLANS['plan1']['price']}", callback_data="plan:plan1")],
-        [InlineKeyboardButton(text=f"{PLANS['plan2']['name']} - {PLANS['plan2']['price']}", callback_data="plan:plan2")],
-        [InlineKeyboardButton(text=f"{PLANS['plan3']['name']} - {PLANS['plan3']['price']}", callback_data="plan:plan3")],
-        [InlineKeyboardButton(text=f"{PLANS['plan4']['name']} - {PLANS['plan4']['price']}", callback_data="plan:plan4")],
+        [InlineKeyboardButton(text=f"{v['name']} - {v['price']}", callback_data=f"plan:{k}")]
+        for k, v in PLANS.items()
     ])
 
-def kb_after_plan(plan_key: str) -> InlineKeyboardMarkup:
+def kb_payment(pid: int, uid: int):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 I Paid — Send Screenshot", callback_data=f"pay:ask:{plan_key}")],
-        [InlineKeyboardButton(text="⬅️ Choose Other Plan", callback_data="menu:buy")],
-    ])
+        [InlineKeyboardButton(text=f"✅ {PLANS[k]['name']}", callback_data=f"approve:{pid}:{uid}:{k}")]
+        for k in PLANS
+    ] + [[InlineKeyboardButton(text="❌ Deny", callback_data=f"deny:{pid}:{uid}")]])
 
-def kb_admin_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⌛ Pending Payments", callback_data="admin:pending")],
-        [InlineKeyboardButton(text="👥 Users", callback_data="admin:users")],
-        [InlineKeyboardButton(text="📊 Stats", callback_data="admin:stats")],
-        [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin:broadcast")],
-    ])
+# ───────── Handlers ─────────
+@dp.message(CommandStart())
+async def start(m: types.Message):
+    upsert_user(m.from_user)
+    await m.answer("Welcome! Choose an option:", reply_markup=kb_user())
 
-def kb_payment_actions(payment_id: int, user_id: int) -> InlineKeyboardMarkup:
-    r1 = [
-        InlineKeyboardButton(text=f"✅ {PLANS['plan1']['name']}", callback_data=f"admin:approve:{payment_id}:{user_id}:plan1"),
-        InlineKeyboardButton(text=f"✅ {PLANS['plan2']['name']}", callback_data=f"admin:approve:{payment_id}:{user_id}:plan2"),
-    ]
-    r2 = [
-        InlineKeyboardButton(text=f"✅ {PLANS['plan3']['name']}", callback_data=f"admin:approve:{payment_id}:{user_id}:plan3"),
-        InlineKeyboardButton(text=f"✅ {PLANS['plan4']['name']}", callback_data=f"admin:approve:{payment_id}:{user_id}:plan4"),
-    ]
-    r3 = [InlineKeyboardButton(text="❌ Deny", callback_data=f"admin:deny:{payment_id}:{user_id}")]
-    r4 = [InlineKeyboardButton(text="💬 Quick Reply", callback_data=f"admin:reply:{user_id}")]
-    return InlineKeyboardMarkup(inline_keyboard=[r1, r2, r3, r4])
+@dp.callback_query(F.data == "buy")
+async def buy(c: types.CallbackQuery):
+    await c.message.edit_text("Choose a plan:", reply_markup=kb_plans())
 
-def fmt_dt(dtiso: Optional[str]) -> str:
-    if not dtiso:
-        return "—"
-    return datetime.fromisoformat(dtiso).astimezone().strftime("%Y-%m-%d %H:%M")
+@dp.callback_query(F.data.startswith("plan:"))
+async def plan_sel(c: types.CallbackQuery):
+    plan = c.data.split(":")[1]
+    last_selected_plan[c.from_user.id] = plan
+    await c.message.answer(f"Send payment to {UPI_ID}\nPrice: {PLANS[plan]['price']}\nThen upload screenshot here.")
 
-def is_admin(uid: int) -> bool:
-    return uid == ADMIN_ID
+@dp.message(F.photo)
+async def handle_payment(m: types.Message):
+    uid = m.from_user.id
+    if uid not in last_selected_plan:
+        return await m.reply("First choose a plan via /start.")
+    plan = last_selected_plan[uid]
+    pid = add_payment(uid, plan, m.photo[-1].file_id)
+    await m.reply("Payment submitted, waiting for admin approval.")
+    await bot.send_photo(ADMIN_ID, m.photo[-1].file_id,
+                         caption=f"Payment from {m.from_user.username or uid} for {PLANS[plan]['name']}",
+                         reply_markup=kb_payment(pid, uid))
 
-# ───────────────────────── FSM for broadcast ─────────────────────────
-class BCast(StatesGroup):
-    waiting_text = State()
+@dp.callback_query(F.data.startswith("approve:"))
+async def approve(c: types.CallbackQuery):
+    _, pid, uid, plan = c.data.split(":")
+    uid, pid = int(uid), int(pid)
+    set_payment_status(pid, "approved")
+    set_subscription(uid, plan, PLANS[plan]["days"])
+    await bot.send_message(uid, f"✅ Payment approved. {PLANS[plan]['name']} activated.")
+    await c.answer("Approved")
 
-# ───────────────────────── Handlers (User + Admin) ─────────────────────────
-# COPY ALL your existing handlers here exactly as in your original code
-# (Start, Buy, Plan selection, Payment, Admin approval, Broadcast, etc.)
+@dp.callback_query(F.data.startswith("deny:"))
+async def deny(c: types.CallbackQuery):
+    _, pid, uid = c.data.split(":")
+    set_payment_status(int(pid), "denied")
+    await bot.send_message(int(uid), "❌ Payment denied. Contact support.")
+    await c.answer("Denied")
 
-# ───────────────────────── Auto-Expiry Worker ─────────────────────────
+@dp.callback_query(F.data == "my")
+async def my_plan(c: types.CallbackQuery):
+    row = get_user(c.from_user.id)
+    if not row or not row["plan_key"]:
+        return await c.message.answer("No active plan.")
+    await c.message.answer(f"Plan: {PLANS[row['plan_key']]['name']}\nEnds: {row['end_at']}")
+
+@dp.callback_query(F.data == "admin")
+async def admin_menu(c: types.CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        return await c.answer("Not allowed")
+    t,a,e,p = stats()
+    await c.message.answer(f"Users: {t}\nActive: {a}\nExpired: {e}\nPending: {p}")
+
+# ───────── Auto-expiry ─────────
 async def expiry_worker():
     while True:
-        try:
-            now = datetime.now(timezone.utc)
-            rows = list_users(10000)
-            for r in rows:
-                uid = r["user_id"]
-                end_at = r["end_at"]
-                status = r["status"]
-                reminded = r["reminded_3d"]
-
-                if end_at:
+        now = datetime.now(timezone.utc)
+        for u in list_users(10000):
+            if u["end_at"]:
+                try:
+                    end = datetime.fromisoformat(u["end_at"])
+                except:
+                    continue
+                if end < now and u["status"] == "active":
+                    with db() as c:
+                        c.execute("UPDATE users SET status='expired' WHERE user_id=?", (u["user_id"],))
+                        c.commit()
                     try:
-                        end = datetime.fromisoformat(end_at)
-                    except Exception:
-                        continue
-
-                    if status == "active" and not reminded and end > now and (end - now) <= timedelta(days=3):
-                        try:
-                            await bot.send_message(uid, "⏳ Your subscription expires in ~3 days. Renew via /start.")
-                            mark_reminded(uid)
-                        except Exception:
-                            pass
-
-                    if end <= now and status != "expired":
-                        set_status(uid, "expired")
-                        try:
-                            await bot.ban_chat_member(CHANNEL_ID, uid)
-                            await bot.unban_chat_member(CHANNEL_ID, uid)
-                        except Exception:
-                            pass
-                        try:
-                            await bot.send_message(uid, "❌ Your subscription expired. Use /start to renew.")
-                        except Exception:
-                            pass
-        except Exception as e:
-            log.exception(f"expiry_worker error: {e}")
+                        await bot.send_message(u["user_id"], "Your subscription expired.")
+                    except: pass
         await asyncio.sleep(1800)
 
-# ───────────────────────── Startup ─────────────────────────
-async def start_bot():
+# ───────── Start Bot ─────────
+async def main():
     init_db()
-    log.info("Starting Telegram bot worker...")
     asyncio.create_task(expiry_worker())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(start_bot())
+    asyncio.run(main())

@@ -405,10 +405,8 @@ async def copy_upi(cq: types.CallbackQuery):
         f"🎯 **Selected Plan:** {plan['emoji']} {plan['name']}\n"
         f"💰 **Amount to Pay:** {plan['price']}\n\n"
         f"📋 **Payment Details:**\n"
-        f"```
-        f"UPI ID: {UPI_ID}\n"
-        f"Amount: {plan['price'].replace('₹', '')}\n"
-        f"```\n\n"
+        f"UPI ID: `{UPI_ID}`\n"
+        f"Amount: `{plan['price'].replace('₹', '')}`\n\n"
         f"📱 **Step-by-Step Payment Guide:**\n"
         f"   1️⃣ **Copy UPI ID** (tap the box above)\n"
         f"   2️⃣ **Open UPI App** (GPay/PhonePe/Paytm)\n"
@@ -454,6 +452,34 @@ async def show_qr(cq: types.CallbackQuery):
         reply_markup=kb_payment_options(plan_key)
     )
     await cq.answer("📱 QR Code ready for scanning!")
+
+@dp.callback_query(F.data.startswith("help:payment:"))
+async def payment_help(cq: types.CallbackQuery):
+    plan_key = cq.data.split(":")[2]
+    plan = PLANS[plan_key]
+    
+    help_text = (
+        f"❓ **PAYMENT HELP CENTER** ❓\n\n"
+        f"🎯 **Selected Plan:** {plan['emoji']} {plan['name']} - {plan['price']}\n\n"
+        f"💡 **Payment Methods Available:**\n"
+        f"   📱 **UPI Apps:** GPay, PhonePe, Paytm, BHIM\n"
+        f"   🏦 **Net Banking:** All major banks\n"
+        f"   💳 **Cards:** Debit/Credit cards via UPI\n\n"
+        f"🔐 **Security Features:**\n"
+        f"   ✅ SSL encrypted transactions\n"
+        f"   ✅ Bank-grade security\n"
+        f"   ✅ No card details stored\n"
+        f"   ✅ Instant payment confirmation\n\n"
+        f"❓ **Common Issues & Solutions:**\n"
+        f"   🔸 **Payment failed?** → Try again after 5 minutes\n"
+        f"   🔸 **Wrong amount?** → Contact support immediately\n"
+        f"   🔸 **UPI not working?** → Try different UPI app\n"
+        f"   🔸 **Screenshot unclear?** → Retake with good lighting\n\n"
+        f"💬 **Need Help?** Contact our support team!"
+    )
+    
+    await cq.message.edit_text(help_text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_payment_options(plan_key))
+    await cq.answer()
 
 @dp.callback_query(F.data.startswith("pay:ask:"))
 async def on_pay_ask(cq: types.CallbackQuery):

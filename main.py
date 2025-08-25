@@ -67,6 +67,15 @@ def is_admin(uid: int) -> bool:
 def safe_text(text) -> str:
     return str(text or "No info").replace("None", "No info")
 
+# FIXED: Timezone-aware datetime helper
+def ensure_timezone_aware(dt):
+    """Ensure datetime is timezone-aware (UTC)"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
 # Database Operations
 async def upsert_user(user: types.User):
     try:
@@ -338,10 +347,10 @@ async def on_my_plan(cq: types.CallbackQuery):
     else:
         plan_info = PLANS.get(user.get('plan_key'), {'name': 'Unknown', 'emoji': '📦'})
         
-        # Calculate remaining time
+        # FIXED: Calculate remaining time with timezone handling
         if user.get('end_at'):
             try:
-                end_date = user['end_at']
+                end_date = ensure_timezone_aware(user['end_at'])
                 now = datetime.now(timezone.utc)
                 time_left = end_date - now
                 
@@ -757,7 +766,7 @@ async def send_reply(m: types.Message, state: FSMContext):
         await state.clear()
 
 @dp.callback_query(F.data.startswith("close_"))
-async def close_ticket(cq: types.CallbackQuery):
+async def close_ticket_handler(cq: types.CallbackQuery):
     if not is_admin(cq.from_user.id):
         await cq.answer("❌ Access denied!", show_alert=True)
         return
@@ -924,9 +933,9 @@ async def admin_reply_command(m: types.Message):
         await m.answer(f"❌ **COMMAND ERROR:** {e}")
         log.error(f"Admin reply command error: {e}")
 
-# Expiry worker
+# FIXED: Expiry worker with timezone handling
 async def expiry_worker():
-    """Enhanced background worker for subscription management"""
+    """Fixed background worker for subscription management"""
     while True:
         try:
             now = datetime.now(timezone.utc)
@@ -944,8 +953,13 @@ async def expiry_worker():
                     continue
                 
                 try:
-                    end_date = end_at
-                except Exception:
+                    # FIXED: Ensure timezone-aware comparison
+                    end_date = ensure_timezone_aware(end_at)
+                    if not end_date:
+                        continue
+                        
+                except Exception as e:
+                    log.error(f"Error processing end_date for user {user_id}: {e}")
                     continue
                 
                 # 3-day expiry reminder
@@ -1005,7 +1019,7 @@ async def main():
         
         # Start expiry worker
         asyncio.create_task(expiry_worker())
-        log.info("✅ Enhanced expiry worker started")
+        log.info("✅ Fixed expiry worker started")
         
         # Start bot
         log.info("🚀 Starting Complete Premium Subscription Bot")

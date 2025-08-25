@@ -34,7 +34,7 @@ MONGO_URI = os.getenv("MONGO_URI") or "mongodb://localhost:27017"
 if API_TOKEN == "TEST_TOKEN":
     raise RuntimeError("❌ Set API_TOKEN in environment variables")
 
-# MongoDB setup with connection pooling
+# MongoDB setup
 mongo_client = AsyncIOMotorClient(MONGO_URI, maxPoolSize=10, minPoolSize=2)
 db = mongo_client['premium_bot']
 users_col = db['users']
@@ -44,7 +44,7 @@ tickets_col = db['support_tickets']
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Subscription Plans
+# Plans
 PLANS = {
     "plan1": {"name": "1 Month", "price": "₹99", "days": 30, "emoji": "🟢"},
     "plan2": {"name": "6 Months", "price": "₹399", "days": 180, "emoji": "🟡", "popular": True},
@@ -53,23 +53,23 @@ PLANS = {
 }
 last_selected_plan: Dict[int, str] = {}
 
+# Track users in support mode
+users_in_support = set()
+
 # FSM States
 class BCast(StatesGroup):
     waiting_text = State()
 
-class SupportState(StatesGroup):
+class SupportReply(StatesGroup):
     waiting_reply = State()
 
-# Helper Functions
 def is_admin(uid: int) -> bool:
     return uid == ADMIN_ID
 
 def safe_text(text) -> str:
     return str(text or "No info").replace("None", "No info")
 
-# FIXED: Timezone-aware datetime helper
 def ensure_timezone_aware(dt):
-    """Ensure datetime is timezone-aware (UTC)"""
     if dt is None:
         return None
     if dt.tzinfo is None:
@@ -157,37 +157,106 @@ async def get_payment(payment_id: str):
         log.error(f"Error getting payment: {e}")
         return None
 
-async def add_ticket(user_id: int, message: str):
+# FIXED: Support System Functions
+async def create_support_ticket(user_id: int, username: str, first_name: str, message: str):
+    """Create a new support ticket"""
     try:
-        result = await tickets_col.insert_one({
+        now = datetime.now(timezone.utc)
+        ticket_data = {
             "user_id": user_id,
-            "messages": [{"from": "user", "text": message, "time": datetime.now(timezone.utc)}],
+            "username": username,
+            "first_name": first_name,
+            "subject": message[:50] + "..." if len(message) > 50 else message,
+            "messages": [
+                {
+                    "from": "user",
+                    "message": message,
+                    "timestamp": now
+                }
+            ],
             "status": "open",
-            "created_at": datetime.now(timezone.utc),
+            "priority": "normal",
+            "created_at": now,
+            "updated_at": now,
             "admin_id": None
-        })
-        return str(result.inserted_id)
+        }
+        
+        result = await tickets_col.insert_one(ticket_data)
+        ticket_id = str(result.inserted_id)
+        
+        log.info(f"Created support ticket {ticket_id} for user {user_id}")
+        return ticket_id
+        
     except Exception as e:
-        log.error(f"Error adding ticket: {e}")
-        return "error"
+        log.error(f"Error creating support ticket: {e}")
+        return None
 
-async def append_ticket_message(ticket_id: str, sender: str, message: str):
+async def add_message_to_ticket(ticket_id: str, sender: str, message: str):
+    """Add a message to existing ticket"""
+    try:
+        now = datetime.now(timezone.utc)
+        await tickets_col.update_one(
+            {"_id": ObjectId(ticket_id)},
+            {
+                "$push": {
+                    "messages": {
+                        "from": sender,
+                        "message": message,
+                        "timestamp": now
+                    }
+                },
+                "$set": {"updated_at": now}
+            }
+        )
+        log.info(f"Added message to ticket {ticket_id} from {sender}")
+        return True
+    except Exception as e:
+        log.error(f"Error adding message to ticket: {e}")
+        return False
+
+async def get_ticket(ticket_id: str):
+    """Get ticket by ID"""
+    try:
+        return await tickets_col.find_one({"_id": ObjectId(ticket_id)})
+    except Exception as e:
+        log.error(f"Error getting ticket {ticket_id}: {e}")
+        return None
+
+async def get_user_active_ticket(user_id: int):
+    """Get user's active ticket if exists"""
+    try:
+        return await tickets_col.find_one({"user_id": user_id, "status": "open"})
+    except Exception as e:
+        log.error(f"Error getting user active ticket: {e}")
+        return None
+
+async def close_support_ticket(ticket_id: str):
+    """Close a support ticket"""
     try:
         await tickets_col.update_one(
             {"_id": ObjectId(ticket_id)},
-            {"$push": {"messages": {"from": sender, "text": message, "time": datetime.now(timezone.utc)}}}
+            {
+                "$set": {
+                    "status": "closed",
+                    "closed_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.now(timezone.utc)
+                }
+            }
         )
-    except Exception as e:
-        log.error(f"Error appending ticket message: {e}")
-
-async def close_ticket(ticket_id: str):
-    try:
-        await tickets_col.update_one(
-            {"_id": ObjectId(ticket_id)},
-            {"$set": {"status": "closed", "closed_at": datetime.now(timezone.utc)}}
-        )
+        log.info(f"Closed support ticket {ticket_id}")
+        return True
     except Exception as e:
         log.error(f"Error closing ticket: {e}")
+        return False
+
+async def get_open_tickets(limit: int = 20):
+    """Get all open tickets"""
+    try:
+        cursor = tickets_col.find({"status": "open"}).sort("updated_at", -1).limit(limit)
+        return await cursor.to_list(length=limit)
+    except Exception as e:
+        log.error(f"Error getting open tickets: {e}")
+        return []
 
 async def get_stats():
     try:
@@ -201,7 +270,7 @@ async def get_stats():
         log.error(f"Error getting stats: {e}")
         return 0, 0, 0, 0, 0
 
-# UI Helper Functions
+# UI Functions
 async def send_photo_fast(chat_id: int, photo_url: str, caption: str, reply_markup=None):
     try:
         await bot.send_photo(chat_id, photo_url, caption=caption, reply_markup=reply_markup)
@@ -228,7 +297,7 @@ async def edit_or_send(cq: types.CallbackQuery, text: str = None, photo_url: str
         except Exception as e:
             log.error(f"Failed to send fallback message: {e}")
 
-# Keyboard Functions
+# Keyboards
 def kb_user_menu() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text="🚀 Upgrade Premium", callback_data="menu_buy")],
@@ -241,6 +310,19 @@ def kb_user_menu() -> InlineKeyboardMarkup:
         buttons.append([InlineKeyboardButton(text="🛠 Admin Panel", callback_data="admin_menu")])
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def kb_support_options() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 New Support Ticket", callback_data="support_new")],
+        [InlineKeyboardButton(text="📋 My Tickets", callback_data="support_my")],
+        [InlineKeyboardButton(text="⬅️ Back to Menu", callback_data="back_menu")]
+    ])
+
+def kb_support_active() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Close Ticket", callback_data="support_close")],
+        [InlineKeyboardButton(text="⬅️ Back to Menu", callback_data="back_menu")]
+    ])
 
 def kb_plans() -> InlineKeyboardMarkup:
     buttons = []
@@ -268,12 +350,8 @@ def kb_payment_options(plan_key: str) -> InlineKeyboardMarkup:
 
 def kb_payment_actions(payment_id: str, user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Approve Payment", callback_data=f"approve_{payment_id}_{user_id}"),
-        ],
-        [
-            InlineKeyboardButton(text="❌ Deny Payment", callback_data=f"deny_{payment_id}_{user_id}")
-        ]
+        [InlineKeyboardButton(text="✅ Approve Payment", callback_data=f"approve_{payment_id}_{user_id}")],
+        [InlineKeyboardButton(text="❌ Deny Payment", callback_data=f"deny_{payment_id}_{user_id}")]
     ])
 
 def kb_admin_menu() -> InlineKeyboardMarkup:
@@ -293,21 +371,28 @@ def kb_admin_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Back to Menu", callback_data="back_menu")]
     ])
 
-def kb_tickets_list(tickets):
+def kb_admin_tickets(tickets) -> InlineKeyboardMarkup:
     buttons = []
-    for ticket in tickets:
-        status = "🟢 Open" if ticket["status"] == "open" else "🔴 Closed"
-        text = f"#{ticket['_id']} - {ticket['user_id']} ({status})"
-        buttons.append([InlineKeyboardButton(text=text, callback_data=f"ticket_{ticket['_id']}")])
+    for ticket in tickets[:10]:  # Limit to 10 tickets
+        ticket_id = str(ticket['_id'])
+        user_id = ticket['user_id']
+        subject = ticket.get('subject', 'No subject')[:30]
+        
+        # Count messages
+        msg_count = len(ticket.get('messages', []))
+        
+        button_text = f"#{ticket_id[-6:]} - {user_id} ({msg_count} msgs)"
+        buttons.append([InlineKeyboardButton(text=button_text, callback_data=f"admin_ticket_{ticket_id}")])
     
+    buttons.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="admin_tickets")])
     buttons.append([InlineKeyboardButton(text="⬅️ Back to Admin", callback_data="admin_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def kb_ticket_actions(ticket_id: str) -> InlineKeyboardMarkup:
+def kb_admin_ticket_actions(ticket_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✏️ Reply", callback_data=f"reply_{ticket_id}"),
-            InlineKeyboardButton(text="✅ Close", callback_data=f"close_{ticket_id}")
+            InlineKeyboardButton(text="✏️ Reply", callback_data=f"admin_reply_{ticket_id}"),
+            InlineKeyboardButton(text="❌ Close", callback_data=f"admin_close_{ticket_id}")
         ],
         [InlineKeyboardButton(text="⬅️ Back to Tickets", callback_data="admin_tickets")]
     ])
@@ -316,11 +401,19 @@ def kb_ticket_actions(ticket_id: str) -> InlineKeyboardMarkup:
 @dp.message(CommandStart())
 async def cmd_start(m: types.Message):
     await upsert_user(m.from_user)
+    # Remove user from support mode when they restart
+    if m.from_user.id in users_in_support:
+        users_in_support.remove(m.from_user.id)
+    
     caption = f"👋 **Hello {m.from_user.first_name}!**\n\n🌟 **Upgrade to Premium:**\n• Unlimited downloads\n• Ad-free experience\n• Priority support\n• High-speed access\n\n🚀 **Ready to upgrade?**"
     await send_photo_fast(m.from_user.id, WELCOME_IMAGE, caption, kb_user_menu())
 
 @dp.callback_query(F.data == "back_menu")
 async def back_to_menu(cq: types.CallbackQuery):
+    # Remove user from support mode
+    if cq.from_user.id in users_in_support:
+        users_in_support.remove(cq.from_user.id)
+    
     caption = f"🏠 **Welcome back {cq.from_user.first_name}!**\n\nChoose an option below:"
     await edit_or_send(cq, text=caption, photo_url=WELCOME_IMAGE, reply_markup=kb_user_menu())
     await cq.answer()
@@ -347,7 +440,6 @@ async def on_my_plan(cq: types.CallbackQuery):
     else:
         plan_info = PLANS.get(user.get('plan_key'), {'name': 'Unknown', 'emoji': '📦'})
         
-        # FIXED: Calculate remaining time with timezone handling
         if user.get('end_at'):
             try:
                 end_date = ensure_timezone_aware(user['end_at'])
@@ -377,11 +469,186 @@ async def on_my_plan(cq: types.CallbackQuery):
     
     await cq.answer()
 
+# FIXED: Complete Support System
 @dp.callback_query(F.data == "menu_support")
-async def on_support(cq: types.CallbackQuery):
-    text = f"💬 **Customer Support**\n\nHi {cq.from_user.first_name}!\n\n📝 **Need help?**\nJust type your message and our support team will respond quickly!\n\n⚡ **Response time:** 5-30 minutes"
-    await edit_or_send(cq, text=text, reply_markup=kb_user_menu())
+async def on_support_menu(cq: types.CallbackQuery):
+    # Check if user has active ticket
+    active_ticket = await get_user_active_ticket(cq.from_user.id)
+    
+    if active_ticket:
+        ticket_id = str(active_ticket['_id'])
+        msg_count = len(active_ticket.get('messages', []))
+        created = active_ticket['created_at'].strftime('%d %b, %H:%M')
+        subject = active_ticket.get('subject', 'No subject')
+        
+        text = f"🎫 **Your Active Support Ticket**\n\n**Ticket ID:** #{ticket_id[-6:]}\n**Subject:** {subject}\n**Created:** {created}\n**Messages:** {msg_count}\n**Status:** 🟢 Open\n\n💬 **Send a message to add to this ticket**\n❌ **Or close the ticket if resolved**"
+        
+        # Add user to support mode
+        users_in_support.add(cq.from_user.id)
+        await edit_or_send(cq, text=text, reply_markup=kb_support_active())
+    else:
+        text = f"💬 **Customer Support**\n\nHi {cq.from_user.first_name}!\n\n🎫 **Create a new support ticket to get help**\n📋 **Or view your previous tickets**"
+        await edit_or_send(cq, text=text, reply_markup=kb_support_options())
+    
     await cq.answer()
+
+@dp.callback_query(F.data == "support_new")
+async def support_new_ticket(cq: types.CallbackQuery):
+    # Check if user already has active ticket
+    active_ticket = await get_user_active_ticket(cq.from_user.id)
+    
+    if active_ticket:
+        await cq.answer("❌ You already have an active support ticket! Close it first to create a new one.", show_alert=True)
+        return
+    
+    text = f"💬 **Create New Support Ticket**\n\nHi {cq.from_user.first_name}!\n\n📝 **Describe your issue or question:**\n\nType your message and I'll create a support ticket for you. Our team will respond quickly!"
+    
+    # Add user to support mode
+    users_in_support.add(cq.from_user.id)
+    await edit_or_send(cq, text=text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="back_menu")]
+    ]))
+    await cq.answer("💬 Type your support message")
+
+@dp.callback_query(F.data == "support_my")
+async def support_my_tickets(cq: types.CallbackQuery):
+    try:
+        # Get user's recent tickets
+        cursor = tickets_col.find({"user_id": cq.from_user.id}).sort("created_at", -1).limit(5)
+        tickets = await cursor.to_list(length=5)
+        
+        if not tickets:
+            text = "📋 **Your Support Tickets**\n\n❌ **No tickets found**\n\nYou haven't created any support tickets yet."
+        else:
+            text = f"📋 **Your Support Tickets** ({len(tickets)})\n\n"
+            
+            for i, ticket in enumerate(tickets, 1):
+                ticket_id = str(ticket['_id'])[-6:]
+                status = "🟢 Open" if ticket['status'] == 'open' else "🔴 Closed"
+                subject = ticket.get('subject', 'No subject')[:30]
+                created = ticket['created_at'].strftime('%d %b')
+                msg_count = len(ticket.get('messages', []))
+                
+                text += f"{i}. **#{ticket_id}** - {status}\n"
+                text += f"   📝 {subject}\n"
+                text += f"   📅 {created} • {msg_count} messages\n\n"
+        
+        await edit_or_send(cq, text=text, reply_markup=kb_support_options())
+        await cq.answer()
+        
+    except Exception as e:
+        log.error(f"Error getting user tickets: {e}")
+        await cq.answer("❌ Error loading tickets", show_alert=True)
+
+@dp.callback_query(F.data == "support_close")
+async def support_close_ticket(cq: types.CallbackQuery):
+    try:
+        # Get user's active ticket
+        active_ticket = await get_user_active_ticket(cq.from_user.id)
+        
+        if not active_ticket:
+            await cq.answer("❌ No active support ticket found", show_alert=True)
+            return
+        
+        ticket_id = str(active_ticket['_id'])
+        
+        # Close the ticket
+        success = await close_support_ticket(ticket_id)
+        
+        if success:
+            # Remove user from support mode
+            if cq.from_user.id in users_in_support:
+                users_in_support.remove(cq.from_user.id)
+            
+            # Notify admin
+            try:
+                admin_msg = f"🎫 **Ticket Closed by User**\n\n**Ticket:** #{ticket_id[-6:]}\n**User:** {cq.from_user.first_name} ({cq.from_user.id})\n**Action:** User closed the ticket"
+                await bot.send_message(ADMIN_ID, admin_msg)
+            except Exception as e:
+                log.error(f"Failed to notify admin about ticket closure: {e}")
+            
+            text = f"✅ **Support Ticket Closed**\n\n**Ticket #{ticket_id[-6:]}** has been closed successfully.\n\n💬 **Need more help?** Create a new support ticket anytime!"
+            await edit_or_send(cq, text=text, reply_markup=kb_user_menu())
+            await cq.answer("✅ Ticket closed successfully!")
+        else:
+            await cq.answer("❌ Error closing ticket", show_alert=True)
+    
+    except Exception as e:
+        log.error(f"Error closing support ticket: {e}")
+        await cq.answer("❌ Error closing ticket", show_alert=True)
+
+# FIXED: User Text Messages (Support System)
+@dp.message(F.text & ~F.command)
+async def on_user_text(message: types.Message):
+    if is_admin(message.from_user.id):
+        return
+    
+    await upsert_user(message.from_user)
+    
+    # Check if user is in support mode or has active ticket
+    user_id = message.from_user.id
+    active_ticket = await get_user_active_ticket(user_id)
+    
+    if user_id in users_in_support or active_ticket:
+        # Handle support message
+        try:
+            if active_ticket:
+                # Add message to existing ticket
+                ticket_id = str(active_ticket['_id'])
+                success = await add_message_to_ticket(ticket_id, "user", message.text)
+                
+                if success:
+                    # Confirm to user
+                    await message.answer(f"✅ **Message added to ticket #{ticket_id[-6:]}**\n\n📩 **Your message:** {message.text[:100]}{'...' if len(message.text) > 100 else ''}\n\n🔔 **Admin will be notified**")
+                    
+                    # Notify admin
+                    user_info = await get_user(user_id)
+                    is_premium = user_info and user_info.get("status") == "active"
+                    priority = "🔥 HIGH PRIORITY" if is_premium else "📋 NORMAL"
+                    
+                    admin_msg = f"🎫 **New Message on Ticket #{ticket_id[-6:]}**\n{priority}\n\n👤 **User:** {message.from_user.first_name} (@{message.from_user.username or 'none'})\n🆔 **ID:** {user_id}\n💎 **Status:** {'PREMIUM' if is_premium else 'FREE'}\n\n💬 **Message:**\n{message.text}\n\n📞 **Reply:** `/reply {ticket_id} Your response`"
+                    
+                    await bot.send_message(ADMIN_ID, admin_msg)
+                    log.info(f"Added message to existing ticket {ticket_id} from user {user_id}")
+                else:
+                    await message.answer("❌ **Error adding message to ticket**\n\nPlease try again or contact admin directly.")
+            else:
+                # Create new ticket
+                ticket_id = await create_support_ticket(
+                    user_id,
+                    message.from_user.username or "none",
+                    message.from_user.first_name,
+                    message.text
+                )
+                
+                if ticket_id:
+                    # Remove from support mode since ticket is created
+                    if user_id in users_in_support:
+                        users_in_support.remove(user_id)
+                    
+                    # Get user info for priority
+                    user_info = await get_user(user_id)
+                    is_premium = user_info and user_info.get("status") == "active"
+                    priority = "🔥 HIGH PRIORITY" if is_premium else "📋 NORMAL"
+                    
+                    # Confirm to user
+                    response_time = "2-5 minutes" if is_premium else "10-30 minutes"
+                    await message.answer(f"✅ **Support Ticket Created!**\n\n🎫 **Ticket ID:** #{ticket_id[-6:]}\n{priority}\n⏱️ **Response Time:** {response_time}\n\n📩 **Your message:** {message.text[:100]}{'...' if len(message.text) > 100 else ''}\n\n🔔 **You'll be notified when admin replies!**")
+                    
+                    # Notify admin
+                    admin_msg = f"🎫 **NEW SUPPORT TICKET #{ticket_id[-6:]}**\n{priority}\n\n👤 **User:** {message.from_user.first_name} (@{message.from_user.username or 'none'})\n🆔 **ID:** {user_id}\n💎 **Status:** {'PREMIUM' if is_premium else 'FREE'}\n\n💬 **Message:**\n{message.text}\n\n📞 **Reply:** `/reply {ticket_id} Your response`"
+                    
+                    await bot.send_message(ADMIN_ID, admin_msg)
+                    log.info(f"Created new support ticket {ticket_id} for user {user_id}")
+                else:
+                    await message.answer("❌ **Error creating support ticket**\n\nPlease try again or contact admin directly.")
+                    
+        except Exception as e:
+            log.error(f"Error handling support message from user {user_id}: {e}")
+            await message.answer("❌ **Error processing your message**\n\nPlease try again or contact admin directly.")
+    else:
+        # Regular message - suggest support
+        await message.answer(f"💬 **Hi {message.from_user.first_name}!**\n\nI see you sent a message. If you need help:\n\n🎫 **Tap Support below to create a ticket**\n🚀 **Or tap Upgrade to go Premium**", reply_markup=kb_user_menu())
 
 @dp.callback_query(F.data.startswith("plan_"))
 async def on_plan(cq: types.CallbackQuery):
@@ -406,7 +673,6 @@ async def copy_upi(cq: types.CallbackQuery):
     
     await edit_or_send(cq, text=msg, reply_markup=kb_payment_options(plan_key))
     
-    # Send UPI ID with HTML formatting for easy copying
     upi_message = f"""📋 <b>UPI PAYMENT DETAILS</b>
 
 <b>UPI ID:</b> <code>{UPI_ID}</code>
@@ -426,7 +692,6 @@ async def copy_upi(cq: types.CallbackQuery):
     try:
         await bot.send_message(cq.from_user.id, upi_message, parse_mode=ParseMode.HTML)
     except:
-        # Fallback without HTML
         await bot.send_message(cq.from_user.id, f"📋 UPI ID: {UPI_ID}\nAmount: {amount_only}\n\nTap and hold UPI ID to copy")
     
     await cq.answer("💳 UPI details sent! Tap and hold UPI ID to copy", show_alert=True)
@@ -452,36 +717,6 @@ async def on_pay_ask(cq: types.CallbackQuery):
     await edit_or_send(cq, text=text)
     await cq.answer("📸 Send payment screenshot!")
 
-# Text and Photo handlers
-@dp.message(F.text & ~F.command)
-async def on_user_text(m: types.Message):
-    if is_admin(m.from_user.id):
-        return
-    
-    await upsert_user(m.from_user)
-    
-    # Get user status for priority
-    user_info = await get_user(m.from_user.id)
-    is_premium = user_info and user_info.get("status") == "active"
-    priority = "HIGH PRIORITY" if is_premium else "STANDARD"
-    
-    username = safe_text(m.from_user.username)
-    first_name = safe_text(m.from_user.first_name)
-    
-    tid = await add_ticket(m.from_user.id, m.text)
-    
-    admin_message = f"🎫 **Support Ticket #{tid}**\n🔥 **Priority:** {priority}\n\n👤 **User:** {first_name} (@{username})\n🆔 **ID:** {m.from_user.id}\n💎 **Status:** {'PREMIUM' if is_premium else 'FREE'}\n\n💬 **Message:**\n{m.text}\n\n📞 **Reply:** `/reply {tid} Your message`"
-    
-    try:
-        await bot.send_message(ADMIN_ID, admin_message)
-        
-        confirm_text = f"✅ **Support ticket created!**\n\n🎫 **Ticket ID:** #{tid}\n🔥 **Priority:** {priority}\n⏱️ **Response time:** {'2-5 min' if is_premium else '10-30 min'}\n\n🔔 **You'll be notified when we reply!**"
-        await m.answer(confirm_text)
-        
-    except Exception as e:
-        log.error(f"Failed to send support ticket: {e}")
-        await m.answer("❌ Error creating ticket. Please try again.")
-
 @dp.message(F.photo)
 async def on_payment_photo(m: types.Message):
     if is_admin(m.from_user.id):
@@ -499,7 +734,6 @@ async def on_payment_photo(m: types.Message):
         
         plan = PLANS[plan_key]
         
-        # Send confirmation to user
         confirmation_text = f"🎉 **Payment proof received!**\n\n📸 **Proof ID:** #{pid}\n📱 **Plan:** {plan['emoji']} {plan['name']}\n💰 **Amount:** {plan['price']}\n\n⏰ **Processing time:** 3-5 minutes\n🔔 **You'll be notified once approved!**"
         
         try:
@@ -507,7 +741,6 @@ async def on_payment_photo(m: types.Message):
         except Exception:
             await m.answer(confirmation_text)
         
-        # Notify admin
         username = safe_text(m.from_user.username)
         first_name = safe_text(m.from_user.first_name)
         
@@ -525,7 +758,7 @@ async def on_payment_photo(m: types.Message):
         log.error(f"Error processing payment photo: {e}")
         await m.answer("❌ Error processing screenshot. Please try uploading again.")
 
-# Admin handlers
+# Admin Handlers
 @dp.callback_query(F.data == "admin_menu")
 async def admin_menu(cq: types.CallbackQuery):
     if not is_admin(cq.from_user.id):
@@ -538,50 +771,206 @@ async def admin_menu(cq: types.CallbackQuery):
     await cq.message.answer(text, reply_markup=kb_admin_menu())
     await cq.answer()
 
-@dp.callback_query(F.data == "admin_stats")
-async def admin_stats(cq: types.CallbackQuery):
-    if not is_admin(cq.from_user.id):
-        await cq.answer("❌ Access denied!", show_alert=True)
-        return
-    
-    total, active, expired, pending, tickets = await get_stats()
-    active_rate = (active/total*100) if total > 0 else 0
-    conversion_rate = ((active + expired)/total*100) if total > 0 else 0
-    
-    text = f"📊 **Comprehensive Analytics**\n\n👥 **User Statistics:**\n📈 Total Users: **{total}**\n✅ Active Subscriptions: **{active}**\n❌ Expired Subscriptions: **{expired}**\n⏳ Pending Payments: **{pending}**\n🎫 Open Support Tickets: **{tickets}**\n\n📈 **Performance Metrics:**\n🎯 Active Rate: **{active_rate:.1f}%**\n💰 Conversion Rate: **{conversion_rate:.1f}%**\n📊 Retention: **{(active/(active+expired)*100) if (active+expired) > 0 else 0:.1f}%**\n\n⏰ **Report Generated:** {datetime.now().strftime('%d %b %Y, %H:%M:%S')}"
-    
-    await cq.message.answer(text)
-    await cq.answer()
-
-@dp.callback_query(F.data == "admin_pending")
-async def admin_pending(cq: types.CallbackQuery):
+@dp.callback_query(F.data == "admin_tickets")
+async def admin_view_tickets(cq: types.CallbackQuery):
     if not is_admin(cq.from_user.id):
         await cq.answer("❌ Access denied!", show_alert=True)
         return
     
     try:
-        cursor = payments_col.find({"status": "pending"}).sort("created_at", -1).limit(10)
-        payments = await cursor.to_list(length=10)
+        tickets = await get_open_tickets(10)
         
-        if not payments:
-            await cq.message.answer("✅ **No pending payments!**\n\nAll payments have been processed.")
+        if not tickets:
+            await cq.message.answer("✅ **No Open Support Tickets**\n\nAll tickets have been resolved!", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Back to Admin", callback_data="admin_menu")]
+            ]))
             await cq.answer()
             return
         
-        await cq.message.answer(f"⏳ **Processing {len(payments)} pending payment(s)**\n\nLoading payment details...")
-        
-        for payment in payments:
-            plan = PLANS[payment['plan_key']]
-            
-            payment_details = f"💵 **Payment Review #{str(payment['_id'])}**\n\n👤 **User ID:** {payment['user_id']}\n📱 **Plan:** {plan['emoji']} {plan['name']}\n💰 **Amount:** {plan['price']}\n⏰ **Submitted:** {payment['created_at'].strftime('%d %b, %H:%M')}\n🔍 **Status:** ⏳ PENDING REVIEW\n\n**👆 Choose action below:**"
-            
-            await cq.message.answer(payment_details, reply_markup=kb_payment_actions(str(payment['_id']), payment['user_id']))
-        
-        await cq.answer(f"📋 {len(payments)} payments ready for review!")
+        text = f"🎫 **Open Support Tickets ({len(tickets)})**\n\nClick on a ticket to view and reply:"
+        await cq.message.answer(text, reply_markup=kb_admin_tickets(tickets))
+        await cq.answer(f"📋 {len(tickets)} open tickets")
         
     except Exception as e:
-        log.error(f"Error getting pending payments: {e}")
-        await cq.answer("❌ Error loading payments!", show_alert=True)
+        log.error(f"Error getting admin tickets: {e}")
+        await cq.answer("❌ Error loading tickets", show_alert=True)
+
+@dp.callback_query(F.data.startswith("admin_ticket_"))
+async def admin_view_ticket(cq: types.CallbackQuery):
+    if not is_admin(cq.from_user.id):
+        await cq.answer("❌ Access denied!", show_alert=True)
+        return
+    
+    try:
+        ticket_id = cq.data.replace("admin_ticket_", "")
+        ticket = await get_ticket(ticket_id)
+        
+        if not ticket:
+            await cq.answer("❌ Ticket not found!", show_alert=True)
+            return
+        
+        # Build ticket details
+        user_id = ticket['user_id']
+        created = ticket['created_at'].strftime('%d %b, %H:%M')
+        subject = ticket.get('subject', 'No subject')
+        messages = ticket.get('messages', [])
+        
+        text = f"🎫 **Ticket #{ticket_id[-6:]}**\n\n👤 **User:** {ticket.get('first_name', 'Unknown')} ({user_id})\n📅 **Created:** {created}\n📝 **Subject:** {subject}\n💬 **Messages:** {len(messages)}\n🔍 **Status:** {ticket['status'].upper()}\n\n**📜 Conversation:**\n"
+        
+        # Add messages (limit to last 5 to avoid message length issues)
+        recent_messages = messages[-5:] if len(messages) > 5 else messages
+        
+        for i, msg in enumerate(recent_messages, 1):
+            sender = "👨‍💼 **Admin**" if msg['from'] == 'admin' else "👤 **User**"
+            timestamp = msg['timestamp'].strftime('%H:%M')
+            message_text = msg['message'][:100] + "..." if len(msg['message']) > 100 else msg['message']
+            text += f"\n{i}. {sender} ({timestamp}):\n   {message_text}\n"
+        
+        if len(messages) > 5:
+            text += f"\n... and {len(messages) - 5} older messages"
+        
+        await cq.message.answer(text, reply_markup=kb_admin_ticket_actions(ticket_id))
+        await cq.answer()
+        
+    except Exception as e:
+        log.error(f"Error viewing ticket: {e}")
+        await cq.answer("❌ Error loading ticket!", show_alert=True)
+
+@dp.callback_query(F.data.startswith("admin_reply_"))
+async def admin_start_reply(cq: types.CallbackQuery, state: FSMContext):
+    if not is_admin(cq.from_user.id):
+        await cq.answer("❌ Access denied!", show_alert=True)
+        return
+    
+    ticket_id = cq.data.replace("admin_reply_", "")
+    await state.update_data(ticket_id=ticket_id)
+    await state.set_state(SupportReply.waiting_reply)
+    
+    await cq.message.answer(f"✏️ **Reply to Ticket #{ticket_id[-6:]}**\n\nType your response message:")
+    await cq.answer("✏️ Type your reply")
+
+@dp.message(SupportReply.waiting_reply)
+async def admin_send_reply(m: types.Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear()
+        return
+    
+    try:
+        data = await state.get_data()
+        ticket_id = data['ticket_id']
+        
+        # Add admin reply to ticket
+        success = await add_message_to_ticket(ticket_id, "admin", m.text)
+        
+        if not success:
+            await m.answer("❌ **Error adding reply to ticket**")
+            await state.clear()
+            return
+        
+        # Get ticket to find user
+        ticket = await get_ticket(ticket_id)
+        if not ticket:
+            await m.answer("❌ **Ticket not found**")
+            await state.clear()
+            return
+        
+        # Send reply to user
+        user_reply = f"💬 **Support Response**\n🎫 **Ticket:** #{ticket_id[-6:]}\n\n{m.text}\n\n─────────────────\n🎧 **Premium Support Team**\n💬 **Need more help?** Just reply to add to this ticket!"
+        
+        try:
+            await bot.send_message(ticket['user_id'], user_reply)
+            await m.answer(f"✅ **Reply sent successfully!**\n\n🎫 **Ticket:** #{ticket_id[-6:]}\n👤 **User:** {ticket['user_id']}\n📩 **Your reply:** {m.text[:100]}{'...' if len(m.text) > 100 else ''}")
+            log.info(f"Admin replied to ticket {ticket_id}")
+        except Exception as e:
+            log.error(f"Failed to send reply to user {ticket['user_id']}: {e}")
+            await m.answer(f"❌ **Failed to send reply to user**\n\nError: {str(e)}")
+        
+        await state.clear()
+        
+    except Exception as e:
+        log.error(f"Error sending admin reply: {e}")
+        await m.answer("❌ **Error sending reply**")
+        await state.clear()
+
+@dp.callback_query(F.data.startswith("admin_close_"))
+async def admin_close_ticket(cq: types.CallbackQuery):
+    if not is_admin(cq.from_user.id):
+        await cq.answer("❌ Access denied!", show_alert=True)
+        return
+    
+    try:
+        ticket_id = cq.data.replace("admin_close_", "")
+        
+        # Get ticket before closing
+        ticket = await get_ticket(ticket_id)
+        if not ticket:
+            await cq.answer("❌ Ticket not found!", show_alert=True)
+            return
+        
+        # Close ticket
+        success = await close_support_ticket(ticket_id)
+        
+        if success:
+            # Notify user
+            user_msg = f"✅ **Ticket Resolved**\n🎫 **Ticket:** #{ticket_id[-6:]}\n\nYour support ticket has been resolved and closed by our admin team.\n\n💬 **Need more help?** Create a new support ticket anytime!"
+            
+            try:
+                await bot.send_message(ticket['user_id'], user_msg)
+            except Exception as e:
+                log.error(f"Failed to notify user about ticket closure: {e}")
+            
+            await cq.message.edit_text(f"✅ **Ticket #{ticket_id[-6:]} Closed**\n\nUser has been notified that the ticket is resolved.")
+            await cq.answer("✅ Ticket closed successfully!")
+            log.info(f"Admin closed ticket {ticket_id}")
+        else:
+            await cq.answer("❌ Error closing ticket", show_alert=True)
+    
+    except Exception as e:
+        log.error(f"Error closing ticket: {e}")
+        await cq.answer("❌ Error closing ticket!", show_alert=True)
+
+# FIXED: Command-based Admin Reply
+@dp.message(Command("reply"))
+@dp.message(Command("replay"))
+async def admin_reply_command(m: types.Message):
+    if not is_admin(m.from_user.id):
+        return
+    
+    try:
+        parts = m.text.split(maxsplit=2)
+        if len(parts) < 3:
+            await m.answer("❌ **USAGE:**\n`/reply <ticket_id> <your_message>`\n`/replay <ticket_id> <your_message>`\n\n**Example:**\n`/reply 507f1f77bcf86cd799439011 Hello, thanks for contacting support!`")
+            return
+        
+        command, ticket_id, reply_text = parts[0], parts[1], parts[2]
+        
+        # Add admin reply to ticket
+        success = await add_message_to_ticket(ticket_id, "admin", reply_text)
+        
+        if not success:
+            await m.answer("❌ **TICKET NOT FOUND**\n\nPlease check the ticket ID.")
+            return
+        
+        # Get ticket to find user
+        ticket = await get_ticket(ticket_id)
+        if not ticket:
+            await m.answer("❌ **TICKET NOT FOUND**\n\nPlease check the ticket ID.")
+            return
+        
+        # Send reply to user
+        user_reply = f"💬 **Support Response**\n🎫 **Ticket:** #{ticket_id[-6:]}\n\n{reply_text}\n\n─────────────────\n🎧 **Premium Support Team**\n💬 **Need more help?** Just reply to add to this ticket!"
+        
+        try:
+            await bot.send_message(ticket['user_id'], user_reply)
+            await m.answer(f"✅ **REPLY SENT SUCCESSFULLY**\n\n🎫 **Ticket:** #{ticket_id[-6:]}\n👤 **User:** {ticket['user_id']}\n📩 **Your message:** {reply_text[:100]}{'...' if len(reply_text) > 100 else ''}")
+            log.info(f"Admin replied to ticket {ticket_id} via command")
+        except Exception as e:
+            await m.answer(f"❌ **FAILED TO SEND REPLY**\n\nError: {str(e)}")
+            log.error(f"Failed to send admin reply via command: {e}")
+        
+    except Exception as e:
+        await m.answer(f"❌ **COMMAND ERROR:** {e}")
+        log.error(f"Admin reply command error: {e}")
 
 @dp.callback_query(F.data.startswith("approve_"))
 async def admin_approve(cq: types.CallbackQuery):
@@ -598,7 +987,6 @@ async def admin_approve(cq: types.CallbackQuery):
         payment_id, user_id_str = parts[1], parts[2]
         user_id = int(user_id_str)
         
-        # Get payment details to find the plan
         payment = await get_payment(payment_id)
         if not payment:
             await cq.answer("❌ Payment not found!", show_alert=True)
@@ -612,7 +1000,6 @@ async def admin_approve(cq: types.CallbackQuery):
         await set_payment_status(payment_id, "approved")
         await set_subscription(user_id, plan_key, plan["days"])
         
-        # Create invite link
         try:
             link = await bot.create_chat_invite_link(CHANNEL_ID, member_limit=1)
             user_msg = f"🎉 **PAYMENT APPROVED!**\n\n✅ Your **{plan['emoji']} {plan['name']}** subscription is now **ACTIVE**!\n💰 **Amount:** {plan['price']}\n⏰ **Valid for:** {plan['days']} days\n\n🔗 **Join Premium Channel:**\n{link.invite_link}\n\n🌟 **Welcome to Premium Family!**\nEnjoy unlimited access to all premium features! 🚀"
@@ -667,132 +1054,50 @@ async def admin_deny(cq: types.CallbackQuery):
         log.error(f"Error denying payment: {e}")
         await cq.answer("❌ Error processing denial!", show_alert=True)
 
-# Support ticket handlers
-@dp.callback_query(F.data == "admin_tickets")
-async def admin_tickets(cq: types.CallbackQuery):
+@dp.callback_query(F.data == "admin_pending")
+async def admin_pending(cq: types.CallbackQuery):
     if not is_admin(cq.from_user.id):
         await cq.answer("❌ Access denied!", show_alert=True)
         return
     
     try:
-        cursor = tickets_col.find({"status": "open"}).sort("created_at", -1).limit(10)
-        tickets = await cursor.to_list(length=10)
+        cursor = payments_col.find({"status": "pending"}).sort("created_at", -1).limit(10)
+        payments = await cursor.to_list(length=10)
         
-        if not tickets:
-            await cq.message.answer("✅ **No open support tickets!**\n\nAll tickets have been resolved.")
+        if not payments:
+            await cq.message.answer("✅ **No pending payments!**\n\nAll payments have been processed.")
             await cq.answer()
             return
         
-        text = f"🎫 **Open Support Tickets ({len(tickets)})**\n\nClick on a ticket to view details and reply:"
-        await cq.message.answer(text, reply_markup=kb_tickets_list(tickets))
-        await cq.answer(f"📋 {len(tickets)} open tickets")
+        await cq.message.answer(f"⏳ **Processing {len(payments)} pending payment(s)**\n\nLoading payment details...")
+        
+        for payment in payments:
+            plan = PLANS[payment['plan_key']]
+            
+            payment_details = f"💵 **Payment Review #{str(payment['_id'])}**\n\n👤 **User ID:** {payment['user_id']}\n📱 **Plan:** {plan['emoji']} {plan['name']}\n💰 **Amount:** {plan['price']}\n⏰ **Submitted:** {payment['created_at'].strftime('%d %b, %H:%M')}\n🔍 **Status:** ⏳ PENDING REVIEW\n\n**👆 Choose action below:**"
+            
+            await cq.message.answer(payment_details, reply_markup=kb_payment_actions(str(payment['_id']), payment['user_id']))
+        
+        await cq.answer(f"📋 {len(payments)} payments ready for review!")
         
     except Exception as e:
-        log.error(f"Error getting tickets: {e}")
-        await cq.answer("❌ Error loading tickets!", show_alert=True)
+        log.error(f"Error getting pending payments: {e}")
+        await cq.answer("❌ Error loading payments!", show_alert=True)
 
-@dp.callback_query(F.data.startswith("ticket_"))
-async def view_ticket(cq: types.CallbackQuery):
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(cq: types.CallbackQuery):
     if not is_admin(cq.from_user.id):
         await cq.answer("❌ Access denied!", show_alert=True)
         return
     
-    try:
-        ticket_id = cq.data.replace("ticket_", "")
-        ticket = await tickets_col.find_one({"_id": ObjectId(ticket_id)})
-        
-        if not ticket:
-            await cq.answer("❌ Ticket not found!", show_alert=True)
-            return
-        
-        # Build conversation
-        text = f"🎫 **Ticket #{ticket_id}**\n\n👤 **User:** {ticket['user_id']}\n📅 **Created:** {ticket['created_at'].strftime('%d %b, %H:%M')}\n🔍 **Status:** {ticket['status'].upper()}\n\n**💬 Conversation:**\n"
-        
-        for i, message in enumerate(ticket.get('messages', []), 1):
-            sender = "👨‍💼 **Admin**" if message['from'] == 'admin' else "👤 **User**"
-            text += f"\n{i}. {sender}: {message['text']}\n"
-        
-        await cq.message.answer(text, reply_markup=kb_ticket_actions(ticket_id))
-        await cq.answer()
-        
-    except Exception as e:
-        log.error(f"Error viewing ticket: {e}")
-        await cq.answer("❌ Error loading ticket!", show_alert=True)
-
-@dp.callback_query(F.data.startswith("reply_"))
-async def reply_ticket(cq: types.CallbackQuery, state: FSMContext):
-    if not is_admin(cq.from_user.id):
-        await cq.answer("❌ Access denied!", show_alert=True)
-        return
+    total, active, expired, pending, tickets = await get_stats()
+    active_rate = (active/total*100) if total > 0 else 0
+    conversion_rate = ((active + expired)/total*100) if total > 0 else 0
     
-    ticket_id = cq.data.replace("reply_", "")
-    await state.update_data(ticket_id=ticket_id)
-    await state.set_state(SupportState.waiting_reply)
+    text = f"📊 **Comprehensive Analytics**\n\n👥 **User Statistics:**\n📈 Total Users: **{total}**\n✅ Active Subscriptions: **{active}**\n❌ Expired Subscriptions: **{expired}**\n⏳ Pending Payments: **{pending}**\n🎫 Open Support Tickets: **{tickets}**\n\n📈 **Performance Metrics:**\n🎯 Active Rate: **{active_rate:.1f}%**\n💰 Conversion Rate: **{conversion_rate:.1f}%**\n📊 Retention: **{(active/(active+expired)*100) if (active+expired) > 0 else 0:.1f}%**\n\n⏰ **Report Generated:** {datetime.now().strftime('%d %b %Y, %H:%M:%S')}"
     
-    await cq.message.answer(f"✏️ **Reply to Ticket #{ticket_id}**\n\nType your response message:")
-    await cq.answer("Type your reply message")
-
-@dp.message(SupportState.waiting_reply)
-async def send_reply(m: types.Message, state: FSMContext):
-    if not is_admin(m.from_user.id):
-        await state.clear()
-        return
-    
-    try:
-        data = await state.get_data()
-        ticket_id = data['ticket_id']
-        
-        # Add reply to ticket
-        await append_ticket_message(ticket_id, "admin", m.text)
-        
-        # Get ticket to find user
-        ticket = await tickets_col.find_one({"_id": ObjectId(ticket_id)})
-        if not ticket:
-            await m.answer("❌ Ticket not found!")
-            await state.clear()
-            return
-        
-        # Send reply to user
-        user_reply = f"💬 **Support Response**\n🎫 **Ticket:** #{ticket_id}\n\n{m.text}\n\n─────────────\n🎧 **Premium Support Team**\n💬 **Need more help?** Just send another message!"
-        
-        await bot.send_message(ticket['user_id'], user_reply)
-        await m.answer(f"✅ **Reply sent to user {ticket['user_id']}**\n\n📩 **Your message:** {m.text[:100]}{'...' if len(m.text) > 100 else ''}")
-        
-        await state.clear()
-        
-    except Exception as e:
-        log.error(f"Error sending reply: {e}")
-        await m.answer("❌ Error sending reply!")
-        await state.clear()
-
-@dp.callback_query(F.data.startswith("close_"))
-async def close_ticket_handler(cq: types.CallbackQuery):
-    if not is_admin(cq.from_user.id):
-        await cq.answer("❌ Access denied!", show_alert=True)
-        return
-    
-    try:
-        ticket_id = cq.data.replace("close_", "")
-        
-        # Close ticket
-        await tickets_col.update_one(
-            {"_id": ObjectId(ticket_id)},
-            {"$set": {"status": "closed", "closed_at": datetime.now(timezone.utc)}}
-        )
-        
-        # Get ticket to find user
-        ticket = await tickets_col.find_one({"_id": ObjectId(ticket_id)})
-        if ticket:
-            # Notify user
-            user_msg = f"✅ **Ticket Closed**\n🎫 **Ticket:** #{ticket_id}\n\nYour support ticket has been resolved and closed by our admin team.\n\n💬 **Need more help?** Just send a new message to create a new ticket!"
-            await bot.send_message(ticket['user_id'], user_msg)
-        
-        await cq.message.edit_text(f"✅ **Ticket #{ticket_id} Closed**\n\nUser has been notified.")
-        await cq.answer("✅ Ticket closed!")
-        
-    except Exception as e:
-        log.error(f"Error closing ticket: {e}")
-        await cq.answer("❌ Error closing ticket!", show_alert=True)
+    await cq.message.answer(text)
+    await cq.answer()
 
 @dp.callback_query(F.data == "admin_users")
 async def admin_users(cq: types.CallbackQuery):
@@ -801,17 +1106,16 @@ async def admin_users(cq: types.CallbackQuery):
         return
     
     try:
-        cursor = users_col.find({}).sort("created_at", -1).limit(50)
-        users = await cursor.to_list(length=50)
+        cursor = users_col.find({}).sort("created_at", -1).limit(20)
+        users = await cursor.to_list(length=20)
         
         if not users:
             await cq.message.answer("👥 **No users found**\n\nThe bot hasn't been used yet.")
             await cq.answer()
             return
         
-        lines = [f"👥 **User Management** (Top 50)\n"]
-        active_count = 0
-        expired_count = 0
+        lines = [f"👥 **User Management** (Top 20)\n"]
+        active_count = expired_count = 0
         
         for i, user in enumerate(users, 1):
             plan_info = PLANS.get(user.get("plan_key"), {"name": "None", "emoji": "⚪"})
@@ -829,14 +1133,9 @@ async def admin_users(cq: types.CallbackQuery):
             
             lines.append(f"{i}. {status_emoji} **{user['user_id']}** (@{username})")
             lines.append(f"   📱 Plan: {plan_name}")
-            lines.append(f"   📊 Status: {user.get('status', 'none').upper()}")
-            if user.get('end_at'):
-                lines.append(f"   ⏰ Expires: {user['end_at'].strftime('%d %b %Y')}\n")
-            else:
-                lines.append("   ⏰ Expires: Never\n")
+            lines.append(f"   📊 Status: {user.get('status', 'none').upper()}\n")
         
         lines.insert(1, f"📊 Active: {active_count} | Expired: {expired_count}\n")
-        
         user_list = "\n".join(lines)
         
         if len(user_list) > 4000:
@@ -886,7 +1185,7 @@ async def broadcast_send(m: types.Message, state: FSMContext):
             broadcast_message = f"📢 **OFFICIAL ANNOUNCEMENT**\n\n{m.text}\n\n───────────────────\n💎 **Premium Bot Team**"
             await bot.send_message(user["user_id"], broadcast_message)
             sent += 1
-            await asyncio.sleep(0.03)  # Rate limiting
+            await asyncio.sleep(0.03)
         except Exception:
             failed += 1
     
@@ -895,47 +1194,8 @@ async def broadcast_send(m: types.Message, state: FSMContext):
     await m.answer(final_report)
     await state.clear()
 
-@dp.message(Command("reply"))
-@dp.message(Command("replay"))
-async def admin_reply_command(m: types.Message):
-    if not is_admin(m.from_user.id):
-        return
-    
-    try:
-        parts = m.text.split(maxsplit=2)
-        if len(parts) < 3:
-            await m.answer("❌ **USAGE:**\n`/reply <ticket_id> <your_message>`\n`/replay <ticket_id> <your_message>`\n\n**Example:**\n`/reply 507f1f77bcf86cd799439011 Hello, thanks for contacting support!`")
-            return
-        
-        command, ticket_id, reply_text = parts[0], parts[1], parts[2]
-        
-        try:
-            # Add reply to ticket
-            await append_ticket_message(ticket_id, "admin", reply_text)
-            
-            # Get ticket to find user
-            ticket = await tickets_col.find_one({"_id": ObjectId(ticket_id)})
-            if not ticket:
-                await m.answer("❌ **TICKET NOT FOUND**\n\nPlease check the ticket ID.")
-                return
-            
-            # Send reply to user
-            user_reply = f"💬 **Support Response**\n🎫 **Ticket:** #{ticket_id}\n\n{reply_text}\n\n─────────────\n🎧 **Premium Support Team**\n💬 **Need more help?** Just send another message!"
-            
-            await bot.send_message(ticket['user_id'], user_reply)
-            await m.answer(f"✅ **REPLY SENT SUCCESSFULLY**\n\n🎫 **Ticket:** #{ticket_id}\n👤 **User:** {ticket['user_id']}\n📩 **Your message:** {reply_text[:100]}{'...' if len(reply_text) > 100 else ''}")
-            
-        except Exception as e:
-            await m.answer(f"❌ **ERROR SENDING REPLY**\n\nError: {str(e)}")
-            log.error(f"Failed to send admin reply: {e}")
-        
-    except Exception as e:
-        await m.answer(f"❌ **COMMAND ERROR:** {e}")
-        log.error(f"Admin reply command error: {e}")
-
-# FIXED: Expiry worker with timezone handling
+# FIXED: Expiry worker
 async def expiry_worker():
-    """Fixed background worker for subscription management"""
     while True:
         try:
             now = datetime.now(timezone.utc)
@@ -953,11 +1213,9 @@ async def expiry_worker():
                     continue
                 
                 try:
-                    # FIXED: Ensure timezone-aware comparison
                     end_date = ensure_timezone_aware(end_at)
                     if not end_date:
                         continue
-                        
                 except Exception as e:
                     log.error(f"Error processing end_date for user {user_id}: {e}")
                     continue
@@ -972,10 +1230,7 @@ async def expiry_worker():
                         reminder_message = f"⏰ **SUBSCRIPTION EXPIRY REMINDER**\n\nYour premium subscription expires in **{days_left}** day(s)!\n\n📅 **Expiry Date:** {end_date.strftime('%d %b %Y, %H:%M')}\n\n🔄 **Renew now to continue enjoying premium features!**\n🚀 **Use /start to renew now!**"
                         
                         await bot.send_message(user_id, reminder_message)
-                        
-                        # Mark as reminded
                         await users_col.update_one({"user_id": user_id}, {"$set": {"reminded_3d": True}})
-                        
                         log.info(f"Sent 3-day reminder to user {user_id}")
                         
                     except Exception as e:
@@ -984,17 +1239,14 @@ async def expiry_worker():
                 # Handle expired subscriptions
                 if end_date <= now and status != "expired":
                     try:
-                        # Update status
                         await users_col.update_one({"user_id": user_id}, {"$set": {"status": "expired"}})
                         
-                        # Remove from channel
                         try:
                             await bot.ban_chat_member(CHANNEL_ID, user_id)
                             await bot.unban_chat_member(CHANNEL_ID, user_id)
                         except Exception as e:
                             log.error(f"Failed to remove user {user_id} from channel: {e}")
                         
-                        # Notify user
                         expiry_message = f"❌ **SUBSCRIPTION EXPIRED**\n\nYour premium subscription has expired.\n\n🔄 **To renew:**\n   1️⃣ Use /start to see plans\n   2️⃣ Choose your plan\n   3️⃣ Complete payment\n   4️⃣ Get instant access back!\n\n💎 **We miss you! Come back to premium!**"
                         
                         await bot.send_message(user_id, expiry_message)
@@ -1006,23 +1258,18 @@ async def expiry_worker():
         except Exception as e:
             log.exception(f"Error in expiry_worker: {e}")
         
-        # Wait 30 minutes before next check
-        await asyncio.sleep(1800)
+        await asyncio.sleep(1800)  # 30 minutes
 
 # Main function
 async def main():
-    """Enhanced main function"""
     try:
-        # Test MongoDB connection
         await mongo_client.admin.command('ping')
         log.info("✅ MongoDB connected successfully")
         
-        # Start expiry worker
         asyncio.create_task(expiry_worker())
-        log.info("✅ Fixed expiry worker started")
+        log.info("✅ Expiry worker started")
         
-        # Start bot
-        log.info("🚀 Starting Complete Premium Subscription Bot")
+        log.info("🚀 Starting Complete Premium Bot with Fixed Support System")
         await dp.start_polling(bot, skip_updates=True)
         
     except Exception as e:

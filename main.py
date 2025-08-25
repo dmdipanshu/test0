@@ -188,7 +188,7 @@ async def plan_select(cq):
     await edit_or_send(cq, text, None, kb_payment_options(plan_key))
     await cq.answer()
 
-# FIXED: UPI with proper tap-to-copy functionality
+# UPI with proper tap-to-copy functionality
 @dp.callback_query(F.data.startswith("upi_"))
 async def upi_pay(cq):
     plan_key = cq.data[4:]  # Faster than replace
@@ -197,7 +197,7 @@ async def upi_pay(cq):
     text = f"💳 UPI Payment\n\nPlan: {plan['emoji']} {plan['name']}\nAmount: {plan['price']}\n\n1. Copy UPI ID below\n2. Pay in UPI app\n3. Upload screenshot"
     await edit_or_send(cq, text, None, kb_payment_options(plan_key))
     
-    # FIXED: Send UPI ID with HTML formatting for better copy functionality
+    # Send UPI ID with HTML formatting for better copy functionality
     upi_message = f"""📋 <b>UPI PAYMENT DETAILS</b>
 
 <b>UPI ID:</b> <code>{UPI_ID}</code>
@@ -239,7 +239,7 @@ async def upload(cq):
     await edit_or_send(cq, text)
     await cq.answer("📸 Send screenshot!")
 
-# OPTIMIZED: Support system
+# Support system
 @dp.message(F.text & ~F.command)
 async def support_msg(m):
     if is_admin(m.from_user.id): 
@@ -256,7 +256,11 @@ async def support_msg(m):
     # Fast admin notification
     admin_msg = f"🎫 SUPPORT #{tid} ({priority})\n👤 {m.from_user.first_name} (@{m.from_user.username or 'none'})\n🆔 {m.from_user.id}\n💎 {'PREMIUM' if priority == 'HIGH' else 'FREE'}\n\n💬 {m.text}\n\n📞 /reply {m.from_user.id} Your response"
     
-    asyncio.create_task(bot.send_message(ADMIN_ID, admin_msg))  # Non-blocking
+    try:
+        await bot.send_message(ADMIN_ID, admin_msg)
+        log.info(f"Support ticket {tid} sent to admin from user {m.from_user.id}")
+    except Exception as e:
+        log.error(f"Failed to send support message to admin: {e}")
     
     response_time = "2-5 min" if priority == "HIGH" else "10-30 min"
     await m.answer(f"✅ Support ticket #{tid} created!\n🔥 Priority: {priority}\n⏰ Response: {response_time}")
@@ -290,7 +294,7 @@ async def payment_photo(m):
         log.error(f"Payment error: {e}")
         await m.answer("❌ Processing error. Try again.")
 
-# FAST: Admin handlers
+# Admin handlers
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve(cq):
     if not is_admin(cq.from_user.id): await cq.answer("❌ Not admin", show_alert=True); return
@@ -425,22 +429,31 @@ async def broadcast_send(m, state: FSMContext):
     await m.answer(f"📢 Broadcast Complete!\n✅ Sent: {sent}\n❌ Failed: {failed}")
     await state.clear()
 
-# FIXED: Admin reply system - properly sends to user
+# FIXED: Admin reply system - handles both /reply and /replay commands
 @dp.message(Command("reply"))
+@dp.message(Command("replay"))  # Added support for /replay command
 async def admin_reply(m):
     if not is_admin(m.from_user.id): 
         return
     
     try:
-        parts = m.text.split(maxsplit=2)
+        # Get the command text and split it
+        command_text = m.text
+        parts = command_text.split(maxsplit=2)
+        
         if len(parts) < 3:
-            await m.answer("❌ USAGE: /reply <user_id> <your_message>\n\nExample: /reply 123456789 Hello, thanks for contacting support!")
+            await m.answer("❌ USAGE:\n/reply <user_id> <your_message>\n/replay <user_id> <your_message>\n\nExample:\n/reply 123456789 Hello, thanks for contacting support!")
             return
         
-        user_id_str, reply_text = parts[1], parts[2]
-        user_id = int(user_id_str)
+        command, user_id_str, reply_text = parts[0], parts[1], parts[2]
         
-        # FIXED: Send properly formatted reply to user
+        try:
+            user_id = int(user_id_str)
+        except ValueError:
+            await m.answer("❌ INVALID USER ID\n\nUser ID must be a number\nUsage: /reply <user_id> <message>")
+            return
+        
+        # Format reply message for user
         user_reply_message = f"""💬 SUPPORT RESPONSE
 
 {reply_text}
@@ -449,20 +462,26 @@ async def admin_reply(m):
 🎧 Premium Support Team
 💬 Need more help? Just send another message!"""
         
-        # FIXED: Ensure message delivery to user
+        # Try to send message to user
         try:
             await bot.send_message(user_id, user_reply_message)
-            await m.answer(f"✅ REPLY SENT SUCCESSFULLY TO USER {user_id}")
-            log.info(f"Admin reply sent to user {user_id}: {reply_text[:50]}...")
+            await m.answer(f"✅ REPLY SENT SUCCESSFULLY TO USER {user_id}\n\n📩 Your message: {reply_text[:100]}{'...' if len(reply_text) > 100 else ''}")
+            log.info(f"Admin reply sent to user {user_id} via {command}: {reply_text[:50]}...")
+            
         except Exception as send_error:
-            await m.answer(f"❌ FAILED TO SEND TO USER {user_id}\nError: {send_error}")
+            error_msg = str(send_error)
+            if "chat not found" in error_msg.lower():
+                await m.answer(f"❌ USER {user_id} NOT FOUND\n\nUser may have:\n• Blocked the bot\n• Deleted their account\n• Never started the bot")
+            elif "blocked" in error_msg.lower():
+                await m.answer(f"❌ USER {user_id} HAS BLOCKED THE BOT\n\nCannot send reply to blocked users.")
+            else:
+                await m.answer(f"❌ FAILED TO SEND TO USER {user_id}\n\nError: {error_msg}")
+            
             log.error(f"Failed to send admin reply to user {user_id}: {send_error}")
         
-    except ValueError:
-        await m.answer("❌ INVALID USER ID\n\nUser ID must be a number\nUsage: /reply <user_id> <message>")
     except Exception as e:
-        await m.answer(f"❌ ERROR: {e}")
-        log.error(f"Admin reply error: {e}")
+        await m.answer(f"❌ COMMAND ERROR: {e}")
+        log.error(f"Admin reply command error: {e}")
 
 # OPTIMIZED: Lightweight expiry worker
 async def expiry_worker():

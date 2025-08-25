@@ -35,21 +35,11 @@ if API_TOKEN == "TEST_TOKEN":
     raise RuntimeError("❌ Set API_TOKEN in environment variables")
 
 # MongoDB setup
-mongo_client = None
-db = None
-users_col = None
-payments_col = None
-tickets_col = None
-
-try:
-    mongo_client = AsyncIOMotorClient(MONGO_URI)
-    db = mongo_client['premium_bot']
-    users_col = db['users']
-    payments_col = db['payments']
-    tickets_col = db['tickets']
-    log.info("MongoDB collections initialized")
-except Exception as e:
-    log.error(f"MongoDB setup failed: {e}")
+mongo_client = AsyncIOMotorClient(MONGO_URI)
+db = mongo_client['premium_bot']
+users_col = db['users']
+payments_col = db['payments']
+tickets_col = db['tickets']
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -62,11 +52,6 @@ PLANS = {
     "plan4": {"name": "Lifetime", "price": "₹2999", "days": 36500, "emoji": "💎"},
 }
 last_selected_plan: Dict[int, str] = {}
-
-# In-memory fallback storage
-memory_users = {}
-memory_payments = {}
-payment_counter = 0
 
 # FSM States
 class BCast(StatesGroup):
@@ -82,43 +67,29 @@ def safe_text(text) -> str:
 # Database Helper Functions
 async def upsert_user(user: types.User):
     try:
-        if users_col is not None:
-            await users_col.update_one(
-                {"user_id": user.id},
-                {"$set": {
-                    "username": user.username,
-                    "first_name": user.first_name,
-                    "last_name": user.last_name,
-                    "updated_at": datetime.now(timezone.utc)
-                }, "$setOnInsert": {
-                    "plan_key": None,
-                    "start_at": None,
-                    "end_at": None,
-                    "status": "none",
-                    "created_at": datetime.now(timezone.utc),
-                    "reminded_3d": False
-                }},
-                upsert=True
-            )
-        else:
-            if user.id not in memory_users:
-                memory_users[user.id] = {
-                    "user_id": user.id,
-                    "username": user.username,
-                    "first_name": user.first_name,
-                    "last_name": user.last_name,
-                    "status": "none",
-                    "created_at": datetime.now(timezone.utc)
-                }
+        await users_col.update_one(
+            {"user_id": user.id},
+            {"$set": {
+                "username": user.username,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "updated_at": datetime.now(timezone.utc)
+            }, "$setOnInsert": {
+                "plan_key": None,
+                "start_at": None,
+                "end_at": None,
+                "status": "none",
+                "created_at": datetime.now(timezone.utc),
+                "reminded_3d": False
+            }},
+            upsert=True
+        )
     except Exception as e:
         log.error(f"Error upserting user: {e}")
 
 async def get_user(user_id: int) -> Optional[dict]:
     try:
-        if users_col is not None:
-            return await users_col.find_one({"user_id": user_id})
-        else:
-            return memory_users.get(user_id)
+        return await users_col.find_one({"user_id": user_id})
     except Exception as e:
         log.error(f"Error getting user: {e}")
         return None
@@ -128,104 +99,71 @@ async def set_subscription(user_id: int, plan_key: str, days: int):
         now = datetime.now(timezone.utc)
         end_date = now + timedelta(days=days)
         
-        if users_col is not None:
-            await users_col.update_one(
-                {"user_id": user_id},
-                {"$set": {
-                    "plan_key": plan_key,
-                    "start_at": now,
-                    "end_at": end_date,
-                    "status": "active",
-                    "reminded_3d": False
-                }}
-            )
-        else:
-            if user_id in memory_users:
-                memory_users[user_id].update({
-                    "plan_key": plan_key,
-                    "start_at": now,
-                    "end_at": end_date,
-                    "status": "active"
-                })
-        
+        await users_col.update_one(
+            {"user_id": user_id},
+            {"$set": {
+                "plan_key": plan_key,
+                "start_at": now,
+                "end_at": end_date,
+                "status": "active",
+                "reminded_3d": False
+            }}
+        )
         return now, end_date
     except Exception as e:
         log.error(f"Error setting subscription: {e}")
         return None, None
 
 async def add_payment(user_id: int, plan_key: str, file_id: str):
-    global payment_counter
     try:
-        if payments_col is not None:
-            result = await payments_col.insert_one({
-                "user_id": user_id,
-                "plan_key": plan_key,
-                "file_id": file_id,
-                "created_at": datetime.now(timezone.utc),
-                "status": "pending"
-            })
-            return str(result.inserted_id)
-        else:
-            payment_counter += 1
-            payment_id = str(payment_counter)
-            memory_payments[payment_id] = {
-                "_id": payment_id,
-                "user_id": user_id,
-                "plan_key": plan_key,
-                "file_id": file_id,
-                "created_at": datetime.now(timezone.utc),
-                "status": "pending"
-            }
-            return payment_id
+        result = await payments_col.insert_one({
+            "user_id": user_id,
+            "plan_key": plan_key,
+            "file_id": file_id,
+            "created_at": datetime.now(timezone.utc),
+            "status": "pending"
+        })
+        return str(result.inserted_id)
     except Exception as e:
         log.error(f"Error adding payment: {e}")
         raise
 
 async def set_payment_status(payment_id: str, status: str):
     try:
-        if payments_col is not None:
-            try:
-                if len(payment_id) == 24:
-                    object_id = ObjectId(payment_id)
-                    result = await payments_col.update_one(
-                        {"_id": object_id},
-                        {"$set": {"status": status}}
-                    )
-                else:
-                    result = await payments_col.update_one(
-                        {"_id": payment_id},
-                        {"$set": {"status": status}}
-                    )
-                
-                if result.modified_count == 0:
-                    log.warning(f"No payment found with ID: {payment_id}")
-                else:
-                    log.info(f"Payment {payment_id} status updated to {status}")
-                    
-            except InvalidId:
-                result = await payments_col.update_one(
-                    {"_id": payment_id},
-                    {"$set": {"status": status}}
-                )
-        else:
-            if payment_id in memory_payments:
-                memory_payments[payment_id]["status"] = status
+        await payments_col.update_one(
+            {"_id": ObjectId(payment_id)},
+            {"$set": {"status": status}}
+        )
+        log.info(f"Payment {payment_id} status updated to {status}")
     except Exception as e:
         log.error(f"Error setting payment status: {e}")
 
+async def get_payment(payment_id: str):
+    try:
+        return await payments_col.find_one({"_id": ObjectId(payment_id)})
+    except Exception as e:
+        log.error(f"Error getting payment: {e}")
+        return None
+
+async def add_ticket(user_id: int, message: str):
+    try:
+        result = await tickets_col.insert_one({
+            "user_id": user_id,
+            "message": message,
+            "status": "open",
+            "created_at": datetime.now(timezone.utc)
+        })
+        return str(result.inserted_id)
+    except Exception as e:
+        log.error(f"Error adding ticket: {e}")
+        return "error"
+
 async def get_stats():
     try:
-        if users_col is not None:
-            total = await users_col.count_documents({})
-            active = await users_col.count_documents({"status": "active"})
-            expired = await users_col.count_documents({"status": "expired"})
-            pending = await payments_col.count_documents({"status": "pending"}) if payments_col is not None else 0
-        else:
-            total = len(memory_users)
-            active = len([u for u in memory_users.values() if u.get("status") == "active"])
-            expired = len([u for u in memory_users.values() if u.get("status") == "expired"])
-            pending = len([p for p in memory_payments.values() if p.get("status") == "pending"])
-        
+        total = await users_col.count_documents({})
+        active = await users_col.count_documents({"status": "active"})
+        expired = await users_col.count_documents({"status": "expired"})
+        pending = await payments_col.count_documents({"status": "pending"})
         return total, active, expired, pending
     except Exception as e:
         log.error(f"Error getting stats: {e}")
@@ -242,24 +180,33 @@ async def safe_send_photo(chat_id: int, photo_url: str, caption: str, reply_mark
         except Exception as e2:
             log.error(f"Failed to send message fallback: {e2}")
 
-async def safe_edit_message(cq: types.CallbackQuery, text: str = None, reply_markup=None):
+async def safe_edit_or_send(cq: types.CallbackQuery, text: str = None, photo_url: str = None, reply_markup=None):
     try:
-        if text:
+        if photo_url:
+            await cq.message.delete()
+            await safe_send_photo(cq.from_user.id, photo_url, text, reply_markup)
+        elif text:
             await cq.message.edit_text(text, reply_markup=reply_markup)
     except Exception:
         try:
-            await cq.message.answer(text, reply_markup=reply_markup)
+            if photo_url:
+                await safe_send_photo(cq.from_user.id, photo_url, text, reply_markup)
+            else:
+                await cq.message.answer(text, reply_markup=reply_markup)
         except Exception as e:
             log.error(f"Failed to send fallback message: {e}")
 
 # Keyboard Functions
 def kb_user_menu() -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(text="🚀 Upgrade Premium", callback_data="menu:buy")],
-        [InlineKeyboardButton(text="📊 My Subscription", callback_data="menu:my"),
-         InlineKeyboardButton(text="💬 Support", callback_data="menu:support")],
-        [InlineKeyboardButton(text="🎁 Special Offers", callback_data="menu:offers")]
+        [InlineKeyboardButton(text="🚀 Upgrade Premium", callback_data="menu_buy")],
+        [InlineKeyboardButton(text="📊 My Subscription", callback_data="menu_my"),
+         InlineKeyboardButton(text="💬 Support", callback_data="menu_support")],
+        [InlineKeyboardButton(text="🎁 Special Offers", callback_data="menu_offers")]
     ]
+    
+    if is_admin:
+        buttons.append([InlineKeyboardButton(text="🛠 Admin Panel", callback_data="admin_menu")])
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -269,183 +216,170 @@ def kb_plans() -> InlineKeyboardMarkup:
         text = f"{plan['emoji']} {plan['name']} - {plan['price']}"
         if plan.get("popular"):
             text += " ⭐"
-        buttons.append([InlineKeyboardButton(text=text, callback_data=f"plan:{plan_key}")])
+        buttons.append([InlineKeyboardButton(text=text, callback_data=f"plan_{plan_key}")])
     
-    buttons.append([InlineKeyboardButton(text="⬅️ Back to Menu", callback_data="back:menu")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Back to Menu", callback_data="back_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def kb_payment_options(plan_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="💳 UPI Payment", callback_data=f"copy:upi:{plan_key}"),
-            InlineKeyboardButton(text="📱 QR Code", callback_data=f"show:qr:{plan_key}")
+            InlineKeyboardButton(text="💳 UPI Payment", callback_data=f"upi_{plan_key}"),
+            InlineKeyboardButton(text="📱 QR Code", callback_data=f"qr_{plan_key}")
         ],
-        [InlineKeyboardButton(text="📸 Upload Payment Proof", callback_data=f"pay:ask:{plan_key}")],
+        [InlineKeyboardButton(text="📸 Upload Payment Proof", callback_data=f"upload_{plan_key}")],
         [
-            InlineKeyboardButton(text="⬅️ Back to Plans", callback_data="menu:buy"),
-            InlineKeyboardButton(text="🏠 Main Menu", callback_data="back:menu")
+            InlineKeyboardButton(text="⬅️ Back to Plans", callback_data="menu_buy"),
+            InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_menu")
         ]
     ])
 
 def kb_payment_actions(payment_id: str, user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ 1M", callback_data=f"approve_{payment_id}_{user_id}_plan1"),
-            InlineKeyboardButton(text="✅ 6M", callback_data=f"approve_{payment_id}_{user_id}_plan2")
+            InlineKeyboardButton(text="✅ Approve Payment", callback_data=f"approve_{payment_id}_{user_id}"),
         ],
         [
-            InlineKeyboardButton(text="✅ 1Y", callback_data=f"approve_{payment_id}_{user_id}_plan3"),
-            InlineKeyboardButton(text="✅ LT", callback_data=f"approve_{payment_id}_{user_id}_plan4")
+            InlineKeyboardButton(text="❌ Deny Payment", callback_data=f"deny_{payment_id}_{user_id}")
+        ]
+    ])
+
+def kb_admin_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⏳ Pending Payments", callback_data="admin_pending"),
+            InlineKeyboardButton(text="📊 Statistics", callback_data="admin_stats")
         ],
-        [InlineKeyboardButton(text="❌ Deny", callback_data=f"deny_{payment_id}_{user_id}")]
+        [
+            InlineKeyboardButton(text="👥 All Users", callback_data="admin_users"),
+            InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast")
+        ],
+        [InlineKeyboardButton(text="⬅️ Back to Menu", callback_data="back_menu")]
     ])
 
 # Bot Handlers
 @dp.message(CommandStart())
 async def cmd_start(m: types.Message):
     await upsert_user(m.from_user)
-    caption = f"👋 Hello {m.from_user.first_name}!\n\n🌟 Upgrade to Premium:\n• Unlimited downloads\n• Ad-free experience\n• Priority support\n\n🚀 Ready to upgrade?"
+    caption = f"👋 **Hello {m.from_user.first_name}!**\n\n🌟 **Upgrade to Premium:**\n• Unlimited downloads\n• Ad-free experience\n• Priority support\n• High-speed access\n\n🚀 **Ready to upgrade?**"
     await safe_send_photo(m.from_user.id, WELCOME_IMAGE, caption, reply_markup=kb_user_menu())
 
-@dp.callback_query(F.data == "back:menu")
+@dp.callback_query(F.data == "back_menu")
 async def back_to_menu(cq: types.CallbackQuery):
-    caption = f"🏠 Welcome back {cq.from_user.first_name}!\n\nChoose an option below:"
-    try:
-        await cq.message.delete()
-    except Exception:
-        pass
-    await safe_send_photo(cq.from_user.id, WELCOME_IMAGE, caption, reply_markup=kb_user_menu())
+    caption = f"🏠 **Welcome back {cq.from_user.first_name}!**\n\nChoose an option below:"
+    await safe_edit_or_send(cq, text=caption, photo_url=WELCOME_IMAGE, reply_markup=kb_user_menu())
     await cq.answer()
 
-@dp.callback_query(F.data == "menu:buy")
+@dp.callback_query(F.data == "menu_buy")
 async def on_buy(cq: types.CallbackQuery):
-    caption = "💎 Premium Plans\n\nChoose your subscription plan:"
-    try:
-        await cq.message.delete()
-    except Exception:
-        pass
-    await safe_send_photo(cq.from_user.id, PLANS_IMAGE, caption, reply_markup=kb_plans())
+    caption = "💎 **Premium Plans**\n\nChoose your subscription plan:"
+    await safe_edit_or_send(cq, text=caption, photo_url=PLANS_IMAGE, reply_markup=kb_plans())
     await cq.answer()
 
-@dp.callback_query(F.data == "menu:offers")
+@dp.callback_query(F.data == "menu_offers")
 async def show_offers(cq: types.CallbackQuery):
-    caption = "🎁 Special Offers\n\n🟡 6 Months: Save 33%\n🔥 1 Year: Best Value\n💎 Lifetime: One-time payment\n\n⏰ Limited time offers!"
-    try:
-        await cq.message.delete()
-    except Exception:
-        pass
-    await safe_send_photo(cq.from_user.id, OFFERS_IMAGE, caption, reply_markup=kb_user_menu())
+    caption = "🎁 **Special Offers**\n\n🟡 **6 Months:** Save 33%\n🔥 **1 Year:** Best Value\n💎 **Lifetime:** One-time payment\n\n⏰ **Limited time offers!**"
+    await safe_edit_or_send(cq, text=caption, photo_url=OFFERS_IMAGE, reply_markup=kb_user_menu())
     await cq.answer()
 
-@dp.callback_query(F.data == "menu:my")
+@dp.callback_query(F.data == "menu_my")
 async def on_my_plan(cq: types.CallbackQuery):
     user = await get_user(cq.from_user.id)
     
     if not user or user.get("status") != "active":
-        caption = "😔 No Active Subscription\n\nYou're using the FREE version.\n\n🌟 Upgrade benefits:\n• Unlimited access\n• No advertisements\n• Priority support\n\n👆 Ready to upgrade?"
-        try:
-            await cq.message.delete()
-        except Exception:
-            pass
-        await safe_send_photo(cq.from_user.id, UPGRADE_IMAGE, caption, reply_markup=kb_user_menu())
+        caption = "😔 **No Active Subscription**\n\nYou're using the FREE version.\n\n🌟 **Upgrade benefits:**\n• Unlimited access\n• No advertisements\n• Priority support\n• Premium features\n\n👆 **Ready to upgrade?**"
+        await safe_edit_or_send(cq, text=caption, photo_url=UPGRADE_IMAGE, reply_markup=kb_user_menu())
     else:
         plan_info = PLANS.get(user.get('plan_key'), {'name': 'Unknown', 'emoji': '📦'})
-        caption = f"📊 My Subscription\n\n✅ Status: ACTIVE\n{plan_info['emoji']} Plan: {plan_info['name']}\n\n🎉 Premium Benefits Active!"
-        await safe_edit_message(cq, text=caption, reply_markup=kb_user_menu())
+        
+        # Calculate remaining time
+        if user.get('end_at'):
+            try:
+                end_date = user['end_at']
+                now = datetime.now(timezone.utc)
+                time_left = end_date - now
+                
+                if time_left.days > 0:
+                    time_display = f"{time_left.days} days, {time_left.seconds // 3600} hours"
+                    status_emoji = "✅"
+                    status_text = "ACTIVE"
+                else:
+                    time_display = "Expired"
+                    status_emoji = "❌"
+                    status_text = "EXPIRED"
+            except Exception:
+                time_display = "Unknown"
+                status_emoji = "⚪"
+                status_text = "UNKNOWN"
+        else:
+            time_display = "Unknown"
+            status_emoji = "⚪"
+            status_text = "UNKNOWN"
+        
+        caption = f"📊 **My Subscription**\n\n{status_emoji} **Status:** {status_text}\n{plan_info['emoji']} **Plan:** {plan_info['name']}\n⏳ **Time Left:** {time_display}\n\n🎉 **Premium Benefits Active!**"
+        
+        await safe_edit_or_send(cq, text=caption, reply_markup=kb_user_menu())
     
     await cq.answer()
 
-@dp.callback_query(F.data == "menu:support")
+@dp.callback_query(F.data == "menu_support")
 async def on_support(cq: types.CallbackQuery):
-    text = f"💬 Customer Support\n\nHi {cq.from_user.first_name}!\n\n📝 Need help?\nJust type your message and our support team will respond quickly!\n\n⚡ Response time: 5-30 minutes"
-    await safe_edit_message(cq, text=text, reply_markup=kb_user_menu())
+    text = f"💬 **Customer Support**\n\nHi {cq.from_user.first_name}!\n\n📝 **Need help?**\nJust type your message and our support team will respond quickly!\n\n⚡ **Response time:** 5-30 minutes"
+    await safe_edit_or_send(cq, text=text, reply_markup=kb_user_menu())
     await cq.answer()
 
-@dp.callback_query(F.data.startswith("plan:"))
+@dp.callback_query(F.data.startswith("plan_"))
 async def on_plan(cq: types.CallbackQuery):
-    plan_key = cq.data.split(":")[1]
+    plan_key = cq.data.replace("plan_", "")
     last_selected_plan[cq.from_user.id] = plan_key
     plan = PLANS[plan_key]
     
     daily_cost = float(plan["price"].replace("₹", "")) / plan["days"]
     
-    caption = f"🎯 {plan['emoji']} {plan['name']} Plan\n\n💰 Price: {plan['price']}\n⏰ Duration: {plan['days']} days\n📊 Daily Cost: ₹{daily_cost:.2f}/day\n\n💳 Choose Payment Method:"
+    caption = f"🎯 **{plan['emoji']} {plan['name']} Plan**\n\n💰 **Price:** {plan['price']}\n⏰ **Duration:** {plan['days']} days\n📊 **Daily Cost:** ₹{daily_cost:.2f}/day\n\n💳 **Choose Payment Method:**"
     
-    await safe_edit_message(cq, text=caption, reply_markup=kb_payment_options(plan_key))
+    await safe_edit_or_send(cq, text=caption, reply_markup=kb_payment_options(plan_key))
     await cq.answer()
 
-# Enhanced UPI with working copy functionality
-@dp.callback_query(F.data.startswith("copy:upi:"))
+@dp.callback_query(F.data.startswith("upi_"))
 async def copy_upi(cq: types.CallbackQuery):
-    plan_key = cq.data.split(":")[2]
+    plan_key = cq.data.replace("upi_", "")
     plan = PLANS[plan_key]
     amount_only = plan['price'].replace('₹', '')
     
-    # Create copyable UPI message
-    upi_message = f"""💳 UPI Payment Details
-
-🎯 Plan: {plan['emoji']} {plan['name']}
-💰 Amount: {plan['price']}
-
-📋 COPY THESE DETAILS:
-
-UPI ID: {UPI_ID}
-Amount: {amount_only}
-
-📱 Quick Steps:
-1. Copy UPI ID above
-2. Open your UPI app (GPay/PhonePe/Paytm)
-3. Send money to copied UPI ID
-4. Enter amount: {amount_only}
-5. Complete payment
-6. Take screenshot of success page
-7. Upload screenshot here
-
-⚠️ Pay exactly {amount_only} rupees
-📸 Screenshot must show payment success and amount"""
+    msg = f"💳 **UPI Payment**\n\n🎯 **Plan:** {plan['emoji']} {plan['name']}\n💰 **Amount:** {plan['price']}\n\n📱 **Quick Steps:**\n1. Copy UPI ID from message below\n2. Open any UPI app (GPay/PhonePe/Paytm)\n3. Paste UPI ID and pay exactly {amount_only}\n4. Upload screenshot after payment"
+    
+    await safe_edit_or_send(cq, text=msg, reply_markup=kb_payment_options(plan_key))
+    
+    # Send separate copyable UPI ID message
+    upi_msg = f"📋 **UPI ID (Long press to copy):**\n\n`{UPI_ID}`\n\n💰 **Amount:** {amount_only}\n\n📸 After payment, upload screenshot here!"
     
     try:
-        await cq.message.edit_text(upi_message, reply_markup=kb_payment_options(plan_key))
+        await bot.send_message(cq.from_user.id, upi_msg, parse_mode=ParseMode.MARKDOWN)
     except Exception:
-        await cq.message.answer(upi_message, reply_markup=kb_payment_options(plan_key))
+        await bot.send_message(cq.from_user.id, upi_msg.replace('`', '').replace('*', ''))
     
-    # Send separate message with just UPI ID for easy copying
-    try:
-        await bot.send_message(
-            cq.from_user.id, 
-            f"📋 UPI ID (Tap to copy):\n\n{UPI_ID}\n\nAmount: {amount_only}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Payment Done - Upload Screenshot", callback_data=f"pay:ask:{plan_key}")]
-            ])
-        )
-    except Exception as e:
-        log.error(f"Failed to send copy message: {e}")
-    
-    await cq.answer("💳 UPI details sent! Copy UPI ID from the message below", show_alert=True)
+    await cq.answer("💳 UPI ID sent below! Long press to copy and pay in your app.", show_alert=True)
 
-@dp.callback_query(F.data.startswith("show:qr:"))
+@dp.callback_query(F.data.startswith("qr_"))
 async def show_qr(cq: types.CallbackQuery):
-    plan_key = cq.data.split(":")[2]
+    plan_key = cq.data.replace("qr_", "")
     plan = PLANS[plan_key]
     
-    caption = f"📱 QR Code Payment\n\n🎯 Plan: {plan['emoji']} {plan['name']}\n💰 Amount: {plan['price']}\n\n📸 Instructions:\n1. Scan QR code below\n2. Pay exact amount\n3. Upload screenshot\n\n⚡ Quick & Secure!"
+    caption = f"📱 **QR Code Payment**\n\n🎯 **Plan:** {plan['emoji']} {plan['name']}\n💰 **Amount:** {plan['price']}\n\n📸 **Instructions:**\n1. Scan QR code below\n2. Pay exact amount\n3. Upload screenshot\n\n⚡ **Quick & Secure!**"
     
-    try:
-        await cq.message.delete()
-    except Exception:
-        pass
-    await safe_send_photo(cq.from_user.id, QR_CODE_URL, caption, reply_markup=kb_payment_options(plan_key))
+    await safe_edit_or_send(cq, text=caption, photo_url=QR_CODE_URL, reply_markup=kb_payment_options(plan_key))
     await cq.answer()
 
-@dp.callback_query(F.data.startswith("pay:ask:"))
+@dp.callback_query(F.data.startswith("upload_"))
 async def on_pay_ask(cq: types.CallbackQuery):
-    plan_key = cq.data.split(":")[2]
+    plan_key = cq.data.replace("upload_", "")
     last_selected_plan[cq.from_user.id] = plan_key
     plan = PLANS[plan_key]
     
-    text = f"📸 Upload Payment Proof\n\n🎯 Plan: {plan['emoji']} {plan['name']} - {plan['price']}\n\n📋 Requirements:\n• Clear screenshot\n• Shows payment success\n• Amount visible\n• Transaction ID visible\n\n📷 Send screenshot as photo now:"
+    text = f"📸 **Upload Payment Proof**\n\n🎯 **Plan:** {plan['emoji']} {plan['name']} - {plan['price']}\n\n📋 **Requirements:**\n• Clear screenshot\n• Shows payment success\n• Amount visible\n• Transaction ID visible\n\n📷 **Send screenshot as photo now:**"
     
-    await safe_edit_message(cq, text=text)
+    await safe_edit_or_send(cq, text=text)
     await cq.answer("📸 Send payment screenshot!")
 
 # Text and Photo handlers
@@ -456,17 +390,27 @@ async def on_user_text(m: types.Message):
     
     await upsert_user(m.from_user)
     
+    # Get user status for priority
+    user_info = await get_user(m.from_user.id)
+    is_premium = user_info and user_info.get("status") == "active"
+    priority = "HIGH PRIORITY" if is_premium else "STANDARD"
+    
     username = safe_text(m.from_user.username)
     first_name = safe_text(m.from_user.first_name)
     
-    admin_message = f"💬 Support Message\n\n👤 User: {first_name} (@{username})\n🆔 ID: {m.from_user.id}\n\nMessage: {m.text}\n\nReply: /reply {m.from_user.id} Your message"
+    tid = await add_ticket(m.from_user.id, m.text)
+    
+    admin_message = f"🎫 **Support Ticket #{tid}**\n🔥 **Priority:** {priority}\n\n👤 **User:** {first_name} (@{username})\n🆔 **ID:** {m.from_user.id}\n💎 **Status:** {'PREMIUM' if is_premium else 'FREE'}\n\n💬 **Message:**\n{m.text}\n\n📞 **Reply:** `/reply {m.from_user.id} Your message`"
     
     try:
-        await bot.send_message(ADMIN_ID, admin_message)
-        await m.answer("✅ Message sent to support!\n\n🔔 You'll get a reply soon.")
+        await bot.send_message(ADMIN_ID, admin_message, parse_mode=ParseMode.MARKDOWN)
+        
+        confirm_text = f"✅ **Support ticket created!**\n\n🎫 **Ticket ID:** #{tid}\n🔥 **Priority:** {priority}\n⏱️ **Response time:** {'2-5 min' if is_premium else '10-30 min'}\n\n🔔 **You'll be notified when we reply!**"
+        await m.answer(confirm_text, parse_mode=ParseMode.MARKDOWN)
+        
     except Exception as e:
-        log.error(f"Failed to send support message: {e}")
-        await m.answer("❌ Error sending message. Please try again.")
+        log.error(f"Failed to send support ticket: {e}")
+        await m.answer("❌ Error creating ticket. Please try again.")
 
 @dp.message(F.photo)
 async def on_payment_photo(m: types.Message):
@@ -486,32 +430,90 @@ async def on_payment_photo(m: types.Message):
         plan = PLANS[plan_key]
         
         # Send confirmation to user
-        confirmation_text = f"🎉 Payment proof received!\n\n📸 Proof ID: #{pid}\n📱 Plan: {plan['emoji']} {plan['name']}\n💰 Amount: {plan['price']}\n\n⏰ Processing time: 3-5 minutes\n🔔 You'll be notified once approved!"
+        confirmation_text = f"🎉 **Payment proof received!**\n\n📸 **Proof ID:** #{pid}\n📱 **Plan:** {plan['emoji']} {plan['name']}\n💰 **Amount:** {plan['price']}\n\n⏰ **Processing time:** 3-5 minutes\n🔔 **You'll be notified once approved!**"
         
         try:
-            await bot.send_photo(m.from_user.id, SUCCESS_IMAGE, caption=confirmation_text)
+            await bot.send_photo(m.from_user.id, SUCCESS_IMAGE, caption=confirmation_text, parse_mode=ParseMode.MARKDOWN)
         except Exception:
-            await m.answer(confirmation_text)
+            await m.answer(confirmation_text, parse_mode=ParseMode.MARKDOWN)
         
         # Notify admin
         username = safe_text(m.from_user.username)
         first_name = safe_text(m.from_user.first_name)
         
-        admin_notification = f"💰 New Payment #{pid}\n\n👤 User: {first_name} (@{username})\n🆔 ID: {m.from_user.id}\n📱 Plan: {plan['emoji']} {plan['name']}\n💵 Amount: {plan['price']}\n⏰ Time: {datetime.now().strftime('%H:%M:%S')}"
+        admin_notification = f"💰 **New Payment #{pid}**\n\n👤 **User:** {first_name} (@{username})\n🆔 **ID:** {m.from_user.id}\n📱 **Plan:** {plan['emoji']} {plan['name']}\n💵 **Amount:** {plan['price']}\n⏰ **Time:** {datetime.now().strftime('%H:%M:%S')}"
         
-        await bot.send_message(ADMIN_ID, admin_notification)
+        await bot.send_message(ADMIN_ID, admin_notification, parse_mode=ParseMode.MARKDOWN)
         await bot.send_photo(
             ADMIN_ID,
             m.photo[-1].file_id,
-            caption=f"💳 Payment Proof #{pid}\n{plan['emoji']} {plan['name']} - {plan['price']}\nUser: {first_name} ({m.from_user.id})",
-            reply_markup=kb_payment_actions(pid, m.from_user.id)
+            caption=f"💳 **Payment Proof #{pid}**\n{plan['emoji']} {plan['name']} - {plan['price']}\n**User:** {first_name} ({m.from_user.id})",
+            reply_markup=kb_payment_actions(pid, m.from_user.id),
+            parse_mode=ParseMode.MARKDOWN
         )
         
     except Exception as e:
         log.error(f"Error processing payment photo: {e}")
         await m.answer("❌ Error processing screenshot. Please try uploading again.")
 
-# Fixed admin handlers - simplified to avoid parsing errors
+# Admin handlers
+@dp.callback_query(F.data == "admin_menu")
+async def admin_menu(cq: types.CallbackQuery):
+    if not is_admin(cq.from_user.id):
+        await cq.answer("❌ Access denied!", show_alert=True)
+        return
+    
+    total, active, expired, pending = await get_stats()
+    text = f"🛠️ **Admin Control Panel**\n\n📊 **Live Statistics:**\n👥 Total Users: **{total}**\n✅ Active Subs: **{active}**\n❌ Expired: **{expired}**\n⏳ Pending: **{pending}**\n\n⚡ **System Status:** Online\n🔄 **Last Updated:** {datetime.now().strftime('%H:%M:%S')}"
+    
+    await cq.message.answer(text, reply_markup=kb_admin_menu(), parse_mode=ParseMode.MARKDOWN)
+    await cq.answer()
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(cq: types.CallbackQuery):
+    if not is_admin(cq.from_user.id):
+        await cq.answer("❌ Access denied!", show_alert=True)
+        return
+    
+    total, active, expired, pending = await get_stats()
+    active_rate = (active/total*100) if total > 0 else 0
+    conversion_rate = ((active + expired)/total*100) if total > 0 else 0
+    
+    text = f"📊 **Comprehensive Analytics**\n\n👥 **User Statistics:**\n📈 Total Users: **{total}**\n✅ Active Subscriptions: **{active}**\n❌ Expired Subscriptions: **{expired}**\n⏳ Pending Payments: **{pending}**\n\n📈 **Performance Metrics:**\n🎯 Active Rate: **{active_rate:.1f}%**\n💰 Conversion Rate: **{conversion_rate:.1f}%**\n📊 Retention: **{(active/(active+expired)*100) if (active+expired) > 0 else 0:.1f}%**\n\n⏰ **Report Generated:** {datetime.now().strftime('%d %b %Y, %H:%M:%S')}"
+    
+    await cq.message.answer(text, parse_mode=ParseMode.MARKDOWN)
+    await cq.answer()
+
+@dp.callback_query(F.data == "admin_pending")
+async def admin_pending(cq: types.CallbackQuery):
+    if not is_admin(cq.from_user.id):
+        await cq.answer("❌ Access denied!", show_alert=True)
+        return
+    
+    try:
+        cursor = payments_col.find({"status": "pending"}).sort("created_at", -1).limit(10)
+        payments = await cursor.to_list(length=10)
+        
+        if not payments:
+            await cq.message.answer("✅ **No pending payments!**\n\nAll payments have been processed.")
+            await cq.answer()
+            return
+        
+        await cq.message.answer(f"⏳ **Processing {len(payments)} pending payment(s)**\n\nLoading payment details...")
+        
+        for payment in payments:
+            plan = PLANS[payment['plan_key']]
+            
+            payment_details = f"💵 **Payment Review #{str(payment['_id'])}**\n\n👤 **User ID:** {payment['user_id']}\n📱 **Plan:** {plan['emoji']} {plan['name']}\n💰 **Amount:** {plan['price']}\n⏰ **Submitted:** {payment['created_at'].strftime('%d %b, %H:%M')}\n🔍 **Status:** ⏳ PENDING REVIEW\n\n**👆 Choose action below:**"
+            
+            await cq.message.answer(payment_details, reply_markup=kb_payment_actions(str(payment['_id']), payment['user_id']), parse_mode=ParseMode.MARKDOWN)
+        
+        await cq.answer(f"📋 {len(payments)} payments ready for review!")
+        
+    except Exception as e:
+        log.error(f"Error getting pending payments: {e}")
+        await cq.answer("❌ Error loading payments!", show_alert=True)
+
 @dp.callback_query(F.data.startswith("approve_"))
 async def admin_approve(cq: types.CallbackQuery):
     if not is_admin(cq.from_user.id):
@@ -520,29 +522,42 @@ async def admin_approve(cq: types.CallbackQuery):
     
     try:
         parts = cq.data.split("_")
-        if len(parts) != 4:
+        if len(parts) != 3:
             await cq.answer("❌ Invalid callback data!", show_alert=True)
             return
             
-        payment_id, user_id_str, plan_key = parts[1], parts[2], parts[1]
-        user_id = int(user_id_str)  # Convert string to int separately
+        payment_id, user_id_str = parts[1], parts[2]
+        user_id = int(user_id_str)
+        
+        # Get payment details to find the plan
+        payment = await get_payment(payment_id)
+        if not payment:
+            await cq.answer("❌ Payment not found!", show_alert=True)
+            return
+        
+        plan_key = payment["plan_key"]
+        plan = PLANS[plan_key]
         
         log.info(f"Processing approval: payment_id={payment_id}, user_id={user_id}, plan_key={plan_key}")
         
         await set_payment_status(payment_id, "approved")
-        await set_subscription(user_id, plan_key, PLANS[plan_key]["days"])
-        plan = PLANS[plan_key]
+        await set_subscription(user_id, plan_key, plan["days"])
         
         # Create invite link
         try:
             link = await bot.create_chat_invite_link(CHANNEL_ID, member_limit=1)
-            user_msg = f"🎉 PAYMENT APPROVED!\n\n✅ Your {plan['emoji']} {plan['name']} subscription is now ACTIVE!\n💰 Amount: {plan['price']}\n⏰ Valid for: {plan['days']} days\n\n🔗 Join Premium Channel:\n{link.invite_link}\n\n🌟 Welcome to Premium Family!\nEnjoy unlimited access to all premium features! 🚀"
+            user_msg = f"🎉 **PAYMENT APPROVED!**\n\n✅ Your **{plan['emoji']} {plan['name']}** subscription is now **ACTIVE**!\n💰 **Amount:** {plan['price']}\n⏰ **Valid for:** {plan['days']} days\n\n🔗 **Join Premium Channel:**\n{link.invite_link}\n\n🌟 **Welcome to Premium Family!**\nEnjoy unlimited access to all premium features! 🚀"
         except Exception as e:
             log.error(f"Error creating invite link: {e}")
-            user_msg = f"🎉 PAYMENT APPROVED!\n\n✅ Your {plan['emoji']} {plan['name']} subscription is now ACTIVE!\n💰 Amount: {plan['price']}\n⏰ Valid for: {plan['days']} days\n\n🌟 Welcome to Premium!\nContact admin for channel access."
+            user_msg = f"🎉 **PAYMENT APPROVED!**\n\n✅ Your **{plan['emoji']} {plan['name']}** subscription is now **ACTIVE**!\n💰 **Amount:** {plan['price']}\n⏰ **Valid for:** {plan['days']} days\n\n🌟 **Welcome to Premium!**\nContact admin for channel access."
         
-        await bot.send_message(user_id, user_msg)
-        await cq.message.edit_text(f"✅ Payment #{payment_id} APPROVED\n\n{plan['emoji']} {plan['name']} activated for user {user_id}!")
+        await bot.send_message(user_id, user_msg, parse_mode=ParseMode.MARKDOWN)
+        
+        try:
+            await cq.message.edit_text(f"✅ **Payment #{payment_id} APPROVED**\n\n{plan['emoji']} **{plan['name']}** activated for user **{user_id}**!", parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await cq.message.answer(f"✅ **Payment #{payment_id} APPROVED**\n\n{plan['emoji']} **{plan['name']}** activated for user **{user_id}**!", parse_mode=ParseMode.MARKDOWN)
+        
         await cq.answer("✅ Approved and activated!")
         
     except Exception as e:
@@ -562,34 +577,127 @@ async def admin_deny(cq: types.CallbackQuery):
             return
             
         payment_id, user_id_str = parts[1], parts[2]
-        user_id = int(user_id_str)  # Convert string to int separately
+        user_id = int(user_id_str)
         
         log.info(f"Processing denial: payment_id={payment_id}, user_id={user_id}")
         
         await set_payment_status(payment_id, "denied")
         
-        user_msg = f"❌ Payment Proof Not Approved\n\nYour payment screenshot for proof #{payment_id} could not be approved.\n\n🔍 Common reasons:\n• Screenshot not clear enough\n• Amount doesn't match plan price\n• Payment status not visible\n• Transaction details missing\n\n🔄 What to do:\n1. Take a clearer screenshot\n2. Ensure all details are visible\n3. Upload again\n\n💬 Need help? Contact support!"
+        user_msg = f"❌ **Payment Proof Not Approved**\n\nYour payment screenshot for proof **#{payment_id}** could not be approved.\n\n🔍 **Common reasons:**\n• Screenshot not clear enough\n• Amount doesn't match plan price\n• Payment status not visible\n• Transaction details missing\n\n🔄 **What to do:**\n1. Take a clearer screenshot\n2. Ensure all details are visible\n3. Upload again\n\n💬 **Need help?** Contact support!"
         
-        await bot.send_message(user_id, user_msg)
-        await cq.message.edit_text(f"❌ Payment #{payment_id} DENIED\n\nUser {user_id} has been notified with improvement suggestions.")
+        await bot.send_message(user_id, user_msg, parse_mode=ParseMode.MARKDOWN)
+        
+        try:
+            await cq.message.edit_text(f"❌ **Payment #{payment_id} DENIED**\n\nUser **{user_id}** has been notified with improvement suggestions.", parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await cq.message.answer(f"❌ **Payment #{payment_id} DENIED**\n\nUser **{user_id}** has been notified with improvement suggestions.", parse_mode=ParseMode.MARKDOWN)
+        
         await cq.answer("❌ Denied with feedback sent!")
         
     except Exception as e:
         log.error(f"Error denying payment: {e}")
         await cq.answer("❌ Error processing denial!", show_alert=True)
 
-@dp.callback_query(F.data == "admin:stats")
-async def admin_stats(cq: types.CallbackQuery):
+@dp.callback_query(F.data == "admin_users")
+async def admin_users(cq: types.CallbackQuery):
     if not is_admin(cq.from_user.id):
         await cq.answer("❌ Access denied!", show_alert=True)
         return
     
-    total, active, expired, pending = await get_stats()
+    try:
+        cursor = users_col.find({}).sort("created_at", -1).limit(50)
+        users = await cursor.to_list(length=50)
+        
+        if not users:
+            await cq.message.answer("👥 **No users found**\n\nThe bot hasn't been used yet.")
+            await cq.answer()
+            return
+        
+        lines = [f"👥 **User Management** (Top 50)\n"]
+        active_count = 0
+        expired_count = 0
+        
+        for i, user in enumerate(users, 1):
+            plan_info = PLANS.get(user.get("plan_key"), {"name": "None", "emoji": "⚪"})
+            plan_name = plan_info["name"] if user.get("plan_key") else "None"
+            username = safe_text(user.get('username'))
+            
+            if user.get('status') == "active":
+                status_emoji = "✅"
+                active_count += 1
+            elif user.get('status') == "expired":
+                status_emoji = "❌"
+                expired_count += 1
+            else:
+                status_emoji = "⚪"
+            
+            lines.append(f"{i}. {status_emoji} **{user['user_id']}** (@{username})")
+            lines.append(f"   📱 Plan: {plan_name}")
+            lines.append(f"   📊 Status: {user.get('status', 'none').upper()}")
+            if user.get('end_at'):
+                lines.append(f"   ⏰ Expires: {user['end_at'].strftime('%d %b %Y')}\n")
+            else:
+                lines.append("   ⏰ Expires: Never\n")
+        
+        lines.insert(1, f"📊 Active: {active_count} | Expired: {expired_count}\n")
+        
+        user_list = "\n".join(lines)
+        
+        if len(user_list) > 4000:
+            await cq.message.answer(user_list[:4000] + "\n\n... **[List truncated]**", parse_mode=ParseMode.MARKDOWN)
+        else:
+            await cq.message.answer(user_list, parse_mode=ParseMode.MARKDOWN)
+        
+        await cq.answer(f"📋 Showing {len(users)} users")
+        
+    except Exception as e:
+        log.error(f"Error getting users: {e}")
+        await cq.answer("❌ Error loading users!", show_alert=True)
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_start(cq: types.CallbackQuery, state: FSMContext):
+    if not is_admin(cq.from_user.id):
+        await cq.answer("❌ Access denied!", show_alert=True)
+        return
     
-    text = f"📊 Bot Statistics\n\n👥 Total Users: {total}\n✅ Active: {active}\n❌ Expired: {expired}\n⏳ Pending: {pending}\n\n⏰ {datetime.now().strftime('%d %b, %H:%M')}"
+    total_users, _, _, _ = await get_stats()
+    text = f"📢 **Broadcast Message Center**\n\n👥 **Target Audience:** {total_users} users\n📡 **Delivery Method:** Direct message\n⚡ **Estimated Time:** {total_users * 0.05:.1f} seconds\n\n✍️ **Send your broadcast message now:**"
     
-    await cq.message.answer(text)
-    await cq.answer()
+    await cq.message.answer(text, parse_mode=ParseMode.MARKDOWN)
+    await state.set_state(BCast.waiting_text)
+    await cq.answer("📢 Ready for broadcast message!")
+
+@dp.message(BCast.waiting_text)
+async def broadcast_send(m: types.Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear()
+        return
+    
+    cursor = users_col.find({}, {"user_id": 1})
+    users = await cursor.to_list(length=None)
+    
+    if not users:
+        await m.answer("❌ **NO USERS TO BROADCAST TO**")
+        await state.clear()
+        return
+    
+    await m.answer(f"📤 **BROADCASTING TO {len(users)} USERS...**")
+    
+    sent = failed = 0
+    
+    for user in users:
+        try:
+            broadcast_message = f"📢 **OFFICIAL ANNOUNCEMENT**\n\n{m.text}\n\n───────────────────\n💎 **Premium Bot Team**"
+            await bot.send_message(user["user_id"], broadcast_message, parse_mode=ParseMode.MARKDOWN)
+            sent += 1
+            await asyncio.sleep(0.05)  # Rate limiting
+        except Exception:
+            failed += 1
+    
+    final_report = f"📢 **BROADCAST COMPLETED!**\n\n✅ **Successfully Sent:** {sent}\n❌ **Failed:** {failed}\n📈 **Success Rate:** {(sent/(sent+failed)*100) if (sent+failed) > 0 else 0:.1f}%"
+    
+    await m.answer(final_report, parse_mode=ParseMode.MARKDOWN)
+    await state.clear()
 
 @dp.message(Command("reply"))
 async def admin_reply(m: types.Message):
@@ -599,31 +707,111 @@ async def admin_reply(m: types.Message):
     try:
         parts = m.text.split(maxsplit=2)
         if len(parts) < 3:
-            await m.answer("❌ Usage: /reply <user_id> <message>")
+            await m.answer("❌ **Usage:** `/reply <user_id> <message>`")
             return
         
         user_id, reply_text = int(parts[1]), parts[2]
         
-        user_msg = f"💬 Support Response\n\n{reply_text}\n\n─────────────\n🎧 Premium Support"
-        await bot.send_message(user_id, user_msg)
-        await m.answer(f"✅ Reply sent to user {user_id}")
+        user_msg = f"💬 **Support Response**\n\n{reply_text}\n\n─────────────\n🎧 **Premium Support Team**\n💬 **Need more help?** Just reply to this message!"
+        await bot.send_message(user_id, user_msg, parse_mode=ParseMode.MARKDOWN)
+        await m.answer(f"✅ **REPLY SENT TO USER {user_id}**")
         
+    except ValueError:
+        await m.answer("❌ **INVALID USER ID**")
     except Exception as e:
         log.error(f"Error sending reply: {e}")
-        await m.answer("❌ Error sending reply")
+        await m.answer("❌ **ERROR SENDING REPLY**")
+
+# Expiry worker
+async def expiry_worker():
+    """Enhanced background worker for subscription management"""
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            
+            cursor = users_col.find({"status": {"$in": ["active", "expired"]}})
+            users = await cursor.to_list(length=None)
+            
+            for user in users:
+                user_id = user["user_id"]
+                status = user.get("status")
+                end_at = user.get("end_at")
+                reminded = user.get("reminded_3d", False)
+                
+                if not end_at:
+                    continue
+                
+                try:
+                    end_date = end_at
+                except Exception:
+                    continue
+                
+                # 3-day expiry reminder
+                if (status == "active" and not reminded and 
+                    end_date > now and (end_date - now) <= timedelta(days=3)):
+                    
+                    try:
+                        days_left = (end_date - now).days
+                        
+                        reminder_message = f"⏰ **SUBSCRIPTION EXPIRY REMINDER**\n\nYour premium subscription expires in **{days_left}** day(s)!\n\n📅 **Expiry Date:** {end_date.strftime('%d %b %Y, %H:%M')}\n\n🔄 **Renew now to continue enjoying premium features!**\n🚀 **Use /start to renew now!**"
+                        
+                        await bot.send_message(user_id, reminder_message, parse_mode=ParseMode.MARKDOWN)
+                        
+                        # Mark as reminded
+                        await users_col.update_one({"user_id": user_id}, {"$set": {"reminded_3d": True}})
+                        
+                        log.info(f"Sent 3-day reminder to user {user_id}")
+                        
+                    except Exception as e:
+                        log.error(f"Failed to send reminder to user {user_id}: {e}")
+                
+                # Handle expired subscriptions
+                if end_date <= now and status != "expired":
+                    try:
+                        # Update status
+                        await users_col.update_one({"user_id": user_id}, {"$set": {"status": "expired"}})
+                        
+                        # Remove from channel
+                        try:
+                            await bot.ban_chat_member(CHANNEL_ID, user_id)
+                            await bot.unban_chat_member(CHANNEL_ID, user_id)
+                        except Exception as e:
+                            log.error(f"Failed to remove user {user_id} from channel: {e}")
+                        
+                        # Notify user
+                        expiry_message = f"❌ **SUBSCRIPTION EXPIRED**\n\nYour premium subscription has expired.\n\n🔄 **To renew:**\n   1️⃣ Use /start to see plans\n   2️⃣ Choose your plan\n   3️⃣ Complete payment\n   4️⃣ Get instant access back!\n\n💎 **We miss you! Come back to premium!**"
+                        
+                        await bot.send_message(user_id, expiry_message, parse_mode=ParseMode.MARKDOWN)
+                        log.info(f"Processed expiry for user {user_id}")
+                        
+                    except Exception as e:
+                        log.error(f"Failed to process expiry for user {user_id}: {e}")
+        
+        except Exception as e:
+            log.exception(f"Error in expiry_worker: {e}")
+        
+        # Wait 30 minutes before next check
+        await asyncio.sleep(1800)
 
 # Main function
 async def main():
-    log.info("🚀 Starting Premium Subscription Bot")
-    
-    if mongo_client is not None:
-        try:
-            await mongo_client.admin.command('ping')
-            log.info("✅ MongoDB connected")
-        except Exception as e:
-            log.warning(f"⚠️ MongoDB connection failed: {e}")
-    
-    await dp.start_polling(bot, skip_updates=True)
+    """Enhanced main function"""
+    try:
+        # Test MongoDB connection
+        await mongo_client.admin.command('ping')
+        log.info("✅ MongoDB connected successfully")
+        
+        # Start expiry worker
+        asyncio.create_task(expiry_worker())
+        log.info("✅ Enhanced expiry worker started")
+        
+        # Start bot
+        log.info("🚀 Starting Enhanced Premium Subscription Bot")
+        await dp.start_polling(bot, skip_updates=True)
+        
+    except Exception as e:
+        log.error(f"❌ Failed to start bot: {e}")
+        raise
 
 if __name__ == "__main__":
     if not all([API_TOKEN != "TEST_TOKEN", ADMIN_ID]):
@@ -633,3 +821,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         log.info("✅ Bot stopped gracefully")
+    except Exception as e:
+        log.error(f"❌ Bot crashed: {e}")
+        raise

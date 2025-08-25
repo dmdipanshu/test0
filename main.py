@@ -52,7 +52,7 @@ class BCast(StatesGroup):
 
 def is_admin(uid): return uid == ADMIN_ID
 
-# OPTIMIZED: Database operations with connection pooling
+# Database operations
 async def upsert_user(user: types.User):
     await users_col.update_one(
         {"user_id": user.id},
@@ -105,7 +105,7 @@ async def get_stats():
     pending = await payments_col.count_documents({"status": "pending"})
     return total, active, expired, pending
 
-# OPTIMIZED: Fast UI functions
+# UI functions
 def kb_user_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Upgrade Premium", callback_data="buy")],
@@ -144,7 +144,7 @@ def kb_admin_menu():
          InlineKeyboardButton(text="📢 Broadcast", callback_data="broadcast")]
     ])
 
-# OPTIMIZED: Fast message sending
+# Message sending functions
 async def send_photo_fast(chat_id, photo_url, text, markup=None):
     try:
         await bot.send_photo(chat_id, photo_url, caption=text, reply_markup=markup)
@@ -164,7 +164,7 @@ async def edit_or_send(cq, text, photo=None, markup=None):
         else:
             await cq.message.answer(text, reply_markup=markup)
 
-# FAST: Bot handlers
+# Bot handlers
 @dp.message(CommandStart())
 async def start(m):
     await upsert_user(m.from_user)
@@ -217,6 +217,7 @@ async def plan_select(cq):
     await edit_or_send(cq, text, None, kb_payment_options(plan_key))
     await cq.answer()
 
+# FIXED: UPI copy functionality
 @dp.callback_query(F.data.startswith("upi_"))
 async def upi_pay(cq):
     plan_key = cq.data.replace("upi_", "")
@@ -224,10 +225,26 @@ async def upi_pay(cq):
     amount = plan["price"].replace("₹", "")
     text = f"💳 UPI Payment\n\nPlan: {plan['emoji']} {plan['name']}\nAmount: {plan['price']}\n\n1. Copy UPI ID below\n2. Pay in UPI app\n3. Upload screenshot"
     await edit_or_send(cq, text, None, kb_payment_options(plan_key))
-    # Send simple copyable UPI message
-    upi_msg = f"📋 UPI ID (tap to copy):\n\n{UPI_ID}\n\nAmount: {amount}\n\nPay and upload screenshot here!"
-    await bot.send_message(cq.from_user.id, upi_msg)
-    await cq.answer("💳 UPI details sent! Copy and pay.")
+    
+    # FIXED: Send UPI ID with proper formatting for easy copying
+    upi_text = f"""📋 TAP TO COPY UPI ID:
+
+{UPI_ID}
+
+💰 AMOUNT: {amount}
+
+📱 STEPS:
+1. Long press the UPI ID above to copy
+2. Open GPay/PhonePe/Paytm 
+3. Send Money → Paste UPI ID
+4. Enter amount: {amount}
+5. Complete payment
+6. Upload screenshot here
+
+⚠️ PAY EXACTLY: {amount} rupees"""
+    
+    await bot.send_message(cq.from_user.id, upi_text)
+    await cq.answer("💳 UPI ID sent! Long press to copy and pay in your UPI app.", show_alert=True)
 
 @dp.callback_query(F.data.startswith("qr_"))
 async def qr_pay(cq):
@@ -246,19 +263,42 @@ async def upload(cq):
     await edit_or_send(cq, text)
     await cq.answer("📸 Send screenshot!")
 
+# FIXED: Support system - User messages to admin
 @dp.message(F.text & ~F.command)
 async def support_msg(m):
-    if is_admin(m.from_user.id): return
+    if is_admin(m.from_user.id): 
+        return
+    
     await upsert_user(m.from_user)
     user = await get_user(m.from_user.id)
-    priority = "HIGH" if user and user.get("status") == "active" else "NORMAL"
+    priority = "HIGH PRIORITY" if user and user.get("status") == "active" else "NORMAL PRIORITY"
     tid = await add_ticket(m.from_user.id, m.text)
     
-    admin_msg = f"💬 Support #{tid} ({priority})\n👤 {m.from_user.first_name} (@{m.from_user.username})\nID: {m.from_user.id}\n\n{m.text}"
-    await bot.send_message(ADMIN_ID, admin_msg)
-    await m.answer(f"✅ Support ticket #{tid} created!\nResponse time: {'2-5 min' if priority == 'HIGH' else '10-30 min'}")
+    # FIXED: Send support message to admin with proper formatting
+    admin_msg = f"""🎫 SUPPORT TICKET #{tid}
 
-# FIXED: Photo handler without markdown parsing errors
+🔥 PRIORITY: {priority}
+
+👤 USER: {m.from_user.first_name}
+📱 USERNAME: @{m.from_user.username or 'No username'}
+🆔 USER ID: {m.from_user.id}
+💎 STATUS: {'PREMIUM' if priority == 'HIGH PRIORITY' else 'FREE USER'}
+
+💬 MESSAGE:
+{m.text}
+
+📞 TO REPLY: /reply {m.from_user.id} Your response message"""
+
+    try:
+        await bot.send_message(ADMIN_ID, admin_msg)
+        log.info(f"Support ticket {tid} sent to admin from user {m.from_user.id}")
+    except Exception as e:
+        log.error(f"Failed to send support message to admin: {e}")
+    
+    # Confirm to user
+    response_time = "2-5 minutes" if priority == "HIGH PRIORITY" else "10-30 minutes"
+    await m.answer(f"✅ Support ticket #{tid} created!\n🔥 Priority: {priority}\n⏰ Response time: {response_time}\n\n🔔 You'll be notified when admin replies!")
+
 @dp.message(F.photo)
 async def payment_photo(m):
     if is_admin(m.from_user.id): return
@@ -272,7 +312,6 @@ async def payment_photo(m):
         pid = await add_payment(m.from_user.id, plan_key, m.photo[-1].file_id)
         plan = PLANS[plan_key]
         
-        # Simple confirmation without markdown
         text = f"🎉 Payment received!\n\nProof #{pid}\nPlan: {plan['emoji']} {plan['name']}\nAmount: {plan['price']}\n\nProcessing... You'll be notified!"
         
         try:
@@ -280,11 +319,9 @@ async def payment_photo(m):
         except:
             await m.answer(text)
         
-        # Simple admin notification
         admin_text = f"💰 Payment #{pid}\n👤 {m.from_user.first_name} (@{m.from_user.username})\nID: {m.from_user.id}\nPlan: {plan['emoji']} {plan['name']} - {plan['price']}"
         await bot.send_message(ADMIN_ID, admin_text)
         
-        # Send photo to admin with action buttons
         await bot.send_photo(ADMIN_ID, m.photo[-1].file_id, 
                            caption=f"Payment #{pid} - {plan['name']} - {plan['price']}\nUser: {m.from_user.id}",
                            reply_markup=kb_payment_actions(pid, m.from_user.id))
@@ -295,7 +332,7 @@ async def payment_photo(m):
         log.error(f"Payment processing error: {e}")
         await m.answer("❌ Processing error. Try again.")
 
-# FAST: Admin handlers
+# Admin handlers
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve(cq):
     if not is_admin(cq.from_user.id): await cq.answer("❌ Not admin", show_alert=True); return
@@ -304,18 +341,15 @@ async def approve(cq):
         parts = cq.data.split("_")
         payment_id, user_id = parts[1], int(parts[2])
         
-        # Get plan from payment record
         payment = await get_payment(payment_id)
         if not payment: await cq.answer("❌ Payment not found", show_alert=True); return
         
         plan_key = payment["plan_key"]
         plan = PLANS[plan_key]
         
-        # Update payment and subscription
         await set_payment_status(payment_id, "approved")
         await set_subscription(user_id, plan_key, plan["days"])
         
-        # User notification
         try:
             link = await bot.create_chat_invite_link(CHANNEL_ID, member_limit=1)
             user_msg = f"🎉 Payment Approved!\n\nYour {plan['emoji']} {plan['name']} is active!\nAmount: {plan['price']}\nDuration: {plan['days']} days\n\nJoin Channel:\n{link.invite_link}\n\nWelcome to Premium!"
@@ -324,7 +358,6 @@ async def approve(cq):
         
         await bot.send_message(user_id, user_msg)
         
-        # Update admin message
         try:
             await cq.message.edit_text(f"✅ APPROVED\nPayment #{payment_id}\n{plan['emoji']} {plan['name']} for user {user_id}")
         except:
@@ -429,59 +462,70 @@ async def broadcast_send(m, state: FSMContext):
         try:
             await bot.send_message(user["user_id"], f"📢 Announcement\n\n{m.text}\n\n──────────\n💎 Premium Bot")
             sent += 1
-            await asyncio.sleep(0.03)  # Fast rate limit
+            await asyncio.sleep(0.03)
         except:
             failed += 1
     
     await m.answer(f"📢 Broadcast Complete!\n✅ Sent: {sent}\n❌ Failed: {failed}")
     await state.clear()
 
+# FIXED: Admin reply system
 @dp.message(Command("reply"))
 async def admin_reply(m):
-    if not is_admin(m.from_user.id): return
+    if not is_admin(m.from_user.id): 
+        return
     
     try:
         parts = m.text.split(maxsplit=2)
         if len(parts) < 3:
-            await m.answer("Usage: /reply <user_id> <message>")
+            await m.answer("❌ USAGE: /reply <user_id> <your_response_message>\n\nExample:\n/reply 123456789 Hello, thanks for your message!")
             return
         
-        user_id, reply = int(parts[1]), parts[2]
-        await bot.send_message(user_id, f"💬 Support Reply:\n\n{reply}\n\n──────────\n🎧 Premium Support")
-        await m.answer(f"✅ Reply sent to {user_id}")
+        user_id, reply_text = int(parts[1]), parts[2]
         
-    except Exception as e:
-        await m.answer(f"❌ Error: {e}")
+        # FIXED: Send formatted reply to user
+        user_reply = f"""💬 SUPPORT RESPONSE
 
-# OPTIMIZED: Lightweight expiry worker
+{reply_text}
+
+──────────────
+🎧 Premium Support Team
+📞 Need more help? Just send another message!"""
+        
+        await bot.send_message(user_id, user_reply)
+        await m.answer(f"✅ REPLY SENT TO USER {user_id}")
+        log.info(f"Admin replied to user {user_id}")
+        
+    except ValueError:
+        await m.answer("❌ INVALID USER ID\n\nUsage: /reply <user_id> <message>")
+    except Exception as e:
+        log.error(f"Admin reply error: {e}")
+        await m.answer(f"❌ ERROR SENDING REPLY: {e}")
+
+# Expiry worker
 async def expiry_worker():
     while True:
         try:
             now = datetime.now(timezone.utc)
             
-            # Process active subscriptions
             cursor = users_col.find({"status": "active", "end_at": {"$lte": now}})
             expired_users = await cursor.to_list(None)
             
             for user in expired_users:
                 try:
-                    # Update to expired
                     await users_col.update_one({"user_id": user["user_id"]}, {"$set": {"status": "expired"}})
                     
-                    # Remove from channel
                     try:
                         await bot.ban_chat_member(CHANNEL_ID, user["user_id"])
                         await bot.unban_chat_member(CHANNEL_ID, user["user_id"])
                     except: pass
                     
-                    # Notify user
                     await bot.send_message(user["user_id"], "❌ Subscription Expired\n\nRenew: /start")
                     log.info(f"Processed expiry for user {user['user_id']}")
                     
                 except Exception as e:
                     log.error(f"Expiry processing error for {user['user_id']}: {e}")
             
-            # Send 3-day reminders
             reminder_date = now + timedelta(days=3)
             cursor = users_col.find({
                 "status": "active", 
@@ -502,14 +546,13 @@ async def expiry_worker():
         except Exception as e:
             log.error(f"Expiry worker error: {e}")
         
-        await asyncio.sleep(1800)  # 30 minutes
+        await asyncio.sleep(1800)
 
 async def main():
     try:
         await mongo_client.admin.command('ping')
         log.info("✅ MongoDB connected")
         
-        # Start optimized expiry worker
         asyncio.create_task(expiry_worker())
         log.info("✅ Fast expiry worker started")
         

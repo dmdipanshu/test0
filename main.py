@@ -147,7 +147,7 @@ def plans_kb():
 
 def payment_kb(plan_id):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Show Payment Info", callback_data=f"pay_{plan_id}")],
+        [InlineKeyboardButton(text="💳 PAY HERE", callback_data=f"pay_{plan_id}")],
         [InlineKeyboardButton(text="📸 Upload Screenshot", callback_data=f"upload_{plan_id}")],
         [InlineKeyboardButton(text="⬅️ Back", callback_data="buy")]
     ])
@@ -228,16 +228,16 @@ async def payment_info_handler(query: types.CallbackQuery):
 📋 <b>Plan:</b> {plan['emoji']} {plan['name']}
 💰 <b>Amount:</b> ₹{plan['price']}
 
-🏦 <b>UPI ID:</b> <code>{UPI_ID}</code>
+🏦 <b>UPI ID:
+
+</b> <code>{UPI_ID}</code>
+
 <i>(Tap UPI ID above to auto-copy)</i>
 
 📱 <b>PAYMENT STEPS:</b>
-1. Tap UPI ID above: <code>{UPI_ID}</code>
-2. Open GPay/PhonePe/Paytm
-3. Send Money → UPI ID → Paste
-4. Enter amount: <b>₹{plan['price']}</b>
-5. Complete payment
-6. Upload screenshot below
+1. Send Money 
+2. Complete payment
+3. Upload screenshot below
 
 ⚡ <b>Premium activated instantly!</b>
 🔗 <b>Channel invite link sent after approval</b>"""

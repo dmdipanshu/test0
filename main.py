@@ -514,7 +514,7 @@ async def approve_handler(query: types.CallbackQuery):
     invite_link_text = ""
     try:
         invite_link = await bot.create_chat_invite_link(CHANNEL_ID, member_limit=1)
-        invite_link_text = f"\n\n🔗 <b>JOIN PREMIUM CHANNEL:</b>\n<code>{invite_link.invite_link}</code>\n\n⚡ <b>Click link above to join!</b>"
+        invite_link_text = f"\n\n🔗 <b>JOIN PREMIUM CHANNEL:</b>{invite_link.invite_link}\n\n⚡ <b>Click link above to join!</b>"
     except Exception as e:
         log.error(f"Failed to create invite link: {e}")
         invite_link_text = "\n\n🔗 <b>Channel access will be provided shortly.</b>"

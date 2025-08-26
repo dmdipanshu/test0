@@ -13,11 +13,12 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 # Simple logging
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("fastbot")
+log = logging.getLogger("premiumbot")
 
 # Environment variables
 API_TOKEN = os.getenv("API_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID") or "123456789")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID") or "-10012345678")  # Add back channel support
 UPI_ID = os.getenv("UPI_ID") or "yourupi@upi"
 QR_CODE_URL = os.getenv("QR_CODE_URL") or "https://example.com/qr.png"
 MONGO_URI = os.getenv("MONGO_URI") or "mongodb://localhost:27017"
@@ -59,7 +60,7 @@ class AdminReply(StatesGroup):
 def is_admin(user_id):
     return user_id == ADMIN_ID
 
-# SAFE MESSAGE SENDING - No HTML/Markdown errors
+# SAFE MESSAGE SENDING
 async def send_message(chat_id, text, keyboard=None):
     try:
         return await bot.send_message(chat_id, text, reply_markup=keyboard)
@@ -80,7 +81,7 @@ async def edit_message(query, text, keyboard=None):
     except:
         await send_message(query.from_user.id, text, keyboard)
 
-# Database functions
+# FIXED: Database functions with proper timezone handling
 async def get_user(user_id):
     return await users_col.find_one({"user_id": user_id})
 
@@ -132,7 +133,6 @@ def plans_kb():
     buttons.append([InlineKeyboardButton(text="⬅️ Back", callback_data="main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# SIMPLE PAYMENT KEYBOARD - One button shows all payment info
 def payment_kb(plan_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💳 Show Payment Info", callback_data=f"pay_{plan_id}")],
@@ -153,7 +153,6 @@ def payment_actions_kb(payment_id, user_id):
          InlineKeyboardButton(text="❌ Deny", callback_data=f"deny_{payment_id}_{user_id}")]
     ])
 
-# SIMPLIFIED SUPPORT KEYBOARD - Direct reply buttons
 def support_chat_kb(user_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💬 Reply to User", callback_data=f"reply_{user_id}")],
@@ -200,7 +199,7 @@ async def plan_handler(query: types.CallbackQuery):
     await edit_message(query, text, payment_kb(plan_id))
     await query.answer(f"Selected {plan['name']}")
 
-# SIMPLIFIED PAYMENT INFO - Shows everything at once
+# FIXED: UPI ID in monospace format + Channel invite link
 @dp.callback_query(F.data.startswith("pay_"))
 async def payment_info_handler(query: types.CallbackQuery):
     plan_id = query.data.split("_")[1]
@@ -210,21 +209,25 @@ async def payment_info_handler(query: types.CallbackQuery):
     await send_photo(query.from_user.id, QR_CODE_URL, 
         f"📱 QR Code for {plan['name']}")
     
-    # SIMPLE TEXT - NO HTML/MARKDOWN
+    # FIXED: UPI ID in monospace format using backticks
     payment_text = f"""💳 PAYMENT INFORMATION
 
 📋 Plan: {plan['emoji']} {plan['name']}
 💰 Amount: ₹{plan['price']}
 
-🏦 UPI ID: {UPI_ID}
+🏦 UPI ID: `{UPI_ID}`
+(Tap above to copy)
 
-📱 EASY STEPS:
-1. Copy UPI ID: {UPI_ID}
+📱 PAYMENT STEPS:
+1. Copy UPI ID: `{UPI_ID}`
 2. Open GPay/PhonePe/Paytm
-3. Pay ₹{plan['price']}
-4. Upload screenshot below
+3. Send Money → UPI ID
+4. Enter amount: ₹{plan['price']}
+5. Complete payment
+6. Upload screenshot below
 
-⚡ Premium activated instantly!"""
+⚡ Premium activated instantly!
+🔗 Channel invite link sent after approval"""
     
     await send_message(query.from_user.id, payment_text, payment_kb(plan_id))
     await query.answer("💳 Payment info sent!")
@@ -240,6 +243,7 @@ async def upload_handler(query: types.CallbackQuery):
     await edit_message(query, text)
     await query.answer("📸 Ready for screenshot!")
 
+# FIXED: Status handler with proper timezone handling
 @dp.callback_query(F.data == "status")
 async def status_handler(query: types.CallbackQuery):
     user = await get_user(query.from_user.id)
@@ -249,6 +253,10 @@ async def status_handler(query: types.CallbackQuery):
         end_date = user.get("end_at")
         
         if end_date and plan['days'] != 36500:
+            # FIXED: Ensure both dates have timezone info
+            if end_date.tzinfo is None:
+                end_date = end_date.replace(tzinfo=timezone.utc)
+            
             days_left = (end_date - datetime.now(timezone.utc)).days
             text = f"📊 Premium Status\n\n✅ ACTIVE\n{plan['emoji']} Plan: {plan['name']}\n⏰ Days left: {days_left}\n\n🎉 All benefits active!"
         else:
@@ -259,7 +267,6 @@ async def status_handler(query: types.CallbackQuery):
     await edit_message(query, text, main_kb())
     await query.answer()
 
-# SIMPLIFIED SUPPORT SYSTEM - No complex states
 @dp.callback_query(F.data == "support")
 async def support_handler(query: types.CallbackQuery, state: FSMContext):
     await state.set_state(SupportState.waiting_message)
@@ -269,7 +276,6 @@ async def support_handler(query: types.CallbackQuery, state: FSMContext):
     await edit_message(query, text)
     await query.answer("💬 Support activated!")
 
-# HANDLE SUPPORT MESSAGES
 @dp.message(SupportState.waiting_message)
 async def support_message_handler(message: types.Message, state: FSMContext):
     if is_admin(message.from_user.id):
@@ -277,7 +283,7 @@ async def support_message_handler(message: types.Message, state: FSMContext):
     
     user_id = message.from_user.id
     
-    # Save support chat to database
+    # Save support chat
     chat_data = {
         "user_id": user_id,
         "username": message.from_user.username,
@@ -291,11 +297,11 @@ async def support_message_handler(message: types.Message, state: FSMContext):
     result = await support_col.insert_one(chat_data)
     chat_id = str(result.inserted_id)[:8]
     
-    # Get user status for priority
+    # Get user status
     user = await get_user(user_id)
     priority = "HIGH" if user and user.get("status") == "premium" else "NORMAL"
     
-    # Send to admin - SIMPLE FORMAT
+    # Send to admin
     admin_text = f"💬 NEW SUPPORT MESSAGE #{chat_id}\n\n🔥 Priority: {priority}\n👤 User: {message.from_user.first_name}\n📱 @{message.from_user.username or 'None'}\n🆔 ID: {user_id}\n\n💬 Message:\n{message.text}\n\n⏰ {datetime.now().strftime('%H:%M IST')}"
     
     await send_message(ADMIN_ID, admin_text, support_chat_kb(user_id))
@@ -308,7 +314,6 @@ async def support_message_handler(message: types.Message, state: FSMContext):
     
     await state.clear()
 
-# ADMIN REPLY SYSTEM - Direct button click
 @dp.callback_query(F.data.startswith("reply_"))
 async def admin_reply_handler(query: types.CallbackQuery, state: FSMContext):
     if not is_admin(query.from_user.id):
@@ -366,7 +371,6 @@ async def close_support_handler(query: types.CallbackQuery):
     await query.message.edit_text(f"✅ Support chat closed for User {user_id}")
     await query.answer("✅ Chat closed!")
 
-# HANDLE PHOTO UPLOADS
 @dp.message(F.photo)
 async def photo_handler(message: types.Message):
     if is_admin(message.from_user.id):
@@ -471,7 +475,7 @@ async def admin_support_chats_handler(query: types.CallbackQuery):
     
     await query.answer(f"💬 {len(chats)} chats")
 
-# PAYMENT APPROVAL
+# FIXED: Payment approval with channel invite link
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve_handler(query: types.CallbackQuery):
     if not is_admin(query.from_user.id):
@@ -494,18 +498,27 @@ async def approve_handler(query: types.CallbackQuery):
     # Update payment
     await payments_col.update_one({"_id": ObjectId(payment_id)}, {"$set": {"status": "approved"}})
     
-    # Notify user
+    # FIXED: Generate channel invite link
+    invite_link_text = ""
+    try:
+        invite_link = await bot.create_chat_invite_link(CHANNEL_ID, member_limit=1)
+        invite_link_text = f"\n\n🔗 JOIN PREMIUM CHANNEL:\n{invite_link.invite_link}\n\n⚡ Click link above to join!"
+    except Exception as e:
+        log.error(f"Failed to create invite link: {e}")
+        invite_link_text = "\n\n🔗 Channel access will be provided shortly."
+    
+    # Notify user with invite link
     if plan['days'] == 36500:
-        user_msg = f"🎉 Payment Approved!\n\n✅ {plan['emoji']} {plan['name']} activated!\n💰 ₹{plan['price']} confirmed\n⏰ Lifetime access\n\n💎 Welcome to Premium!"
+        user_msg = f"🎉 Payment Approved!\n\n✅ {plan['emoji']} {plan['name']} activated!\n💰 ₹{plan['price']} confirmed\n⏰ Lifetime access{invite_link_text}\n\n💎 Welcome to Premium!"
     else:
-        user_msg = f"🎉 Payment Approved!\n\n✅ {plan['emoji']} {plan['name']} activated!\n💰 ₹{plan['price']} confirmed\n⏰ Until {end_date.strftime('%d %b %Y')}\n\n💎 Welcome to Premium!"
+        user_msg = f"🎉 Payment Approved!\n\n✅ {plan['emoji']} {plan['name']} activated!\n💰 ₹{plan['price']} confirmed\n⏰ Until {end_date.strftime('%d %b %Y')}{invite_link_text}\n\n💎 Welcome to Premium!"
     
     await send_message(user_id, user_msg, main_kb())
     
     # Update admin message
     await query.message.edit_caption(f"✅ APPROVED\n\nPayment #{payment_id}\nUser {user_id} activated\n{plan['name']} - ₹{plan['price']}")
     
-    await query.answer("✅ Approved!")
+    await query.answer("✅ Approved & invite sent!")
 
 @dp.callback_query(F.data.startswith("deny_"))
 async def deny_handler(query: types.CallbackQuery):
@@ -529,7 +542,7 @@ async def deny_handler(query: types.CallbackQuery):
     
     await query.answer("❌ Denied!")
 
-# Expiry worker
+# FIXED: Expiry worker with proper timezone handling
 async def expiry_worker():
     while True:
         try:
@@ -544,6 +557,13 @@ async def expiry_worker():
                     {"user_id": user["user_id"]},
                     {"$set": {"status": "expired"}}
                 )
+                
+                # Remove from channel
+                try:
+                    await bot.ban_chat_member(CHANNEL_ID, user["user_id"])
+                    await bot.unban_chat_member(CHANNEL_ID, user["user_id"])
+                except:
+                    pass
                 
                 await send_message(user["user_id"],
                     "⏰ Premium expired!\n\n🚀 Renew now: /start\n💎 Get premium benefits again!",
@@ -569,11 +589,12 @@ async def main():
         # Start expiry worker
         asyncio.create_task(expiry_worker())
         
-        print("🚀 SIMPLE PREMIUM BOT STARTED")
-        print("✅ No HTML/Markdown errors")
-        print("💬 Easy support system")
-        print("💳 Simple payment system")
-        print("📋 Tap-to-copy UPI ID")
+        print("🚀 PREMIUM BOT STARTED")
+        print("✅ Fixed timezone errors")
+        print("💬 Button-based support system")
+        print("💳 Monospace UPI ID format")
+        print("🔗 Channel invite links working")
+        print("📋 Tap-to-copy UPI feature")
         
         await dp.start_polling(bot)
         

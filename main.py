@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("subbot")
 
 # ───────────────────────── Config (ENV based for Koyeb) ─────────────────────────
-API_TOKEN = os.getenv("API_TOKEN") or "TEST_TOKEN"
+API_TOKEN = os.getenv("API_TOKEN") or "6838473237:AAFRh0ZTHfz5r-H7Gi3OgPZIQkGZXwd_z2M"
 ADMIN_ID = int(os.getenv("ADMIN_ID") or "123456789")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID") or "-10012345678")
 UPI_ID = os.getenv("UPI_ID") or "yourupi@upi"
